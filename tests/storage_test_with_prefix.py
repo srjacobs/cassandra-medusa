@@ -24,7 +24,7 @@ import unittest
 
 import medusa.storage.abstract_storage
 
-from medusa.backup import generate_md5_hash
+from medusa.backup_node import generate_md5_hash
 from medusa.config import MedusaConfig, StorageConfig, _namedtuple_from_dict, CassandraConfig
 from medusa.index import build_indices
 from medusa.storage import Storage
@@ -64,8 +64,10 @@ class RestoreNodeTest(unittest.TestCase):
             cassandra=_namedtuple_from_dict(CassandraConfig, config['cassandra']),
             monitoring={},
             ssh=None,
-            restore=None,
-            logging=None
+            checks=None,
+            logging=None,
+            grpc=None,
+            kubernetes=None,
         )
 
         self.storage = Storage(config=self.config.storage)

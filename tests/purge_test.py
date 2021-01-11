@@ -44,8 +44,10 @@ class PurgeTest(unittest.TestCase):
             monitoring={},
             cassandra=None,
             ssh=None,
-            restore=None,
+            checks=None,
             logging=None,
+            grpc=None,
+            kubernetes=None,
         )
         self.storage = Storage(config=self.config.storage)
 

@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright 2020- Datastax, Inc. All rights reserved.
+# Copyright 2020 Spotify Inc. All rights reserved.
 # Copyright 2019 Spotify AB. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,7 +16,9 @@
 # limitations under the License.
 
 
+import fileinput
 import itertools
+import json
 import logging
 import os
 import pathlib
@@ -22,14 +26,17 @@ import shlex
 import socket
 import subprocess
 import time
-import uuid
 import yaml
+import requests
+import medusa.utils
 
 from subprocess import PIPE
-
+from retrying import retry
 from cassandra.cluster import Cluster, ExecutionProfile
 from cassandra.policies import WhiteListRoundRobinPolicy
 from cassandra.auth import PlainTextAuthProvider
+from ssl import SSLContext, PROTOCOL_TLSv1, CERT_REQUIRED
+from medusa.network.hostname_resolver import HostnameResolver
 
 
 class SnapshotPath(object):
@@ -46,11 +53,26 @@ class SnapshotPath(object):
 
 class CqlSessionProvider(object):
 
-    def __init__(self, ip_addresses, *, username=None, password=None):
+    def __init__(self, ip_addresses, cassandra_config):
         self._ip_addresses = ip_addresses
+        self._auth_provider = None
+        self._ssl_context = None
+        self._cassandra_config = cassandra_config
 
-        auth_provider = PlainTextAuthProvider(username=username, password=password) if username and password else None
-        self._auth_provider = auth_provider
+        if cassandra_config.cql_username is not None and cassandra_config.cql_password is not None:
+            auth_provider = PlainTextAuthProvider(username=cassandra_config.cql_username,
+                                                  password=cassandra_config.cql_password)
+            self._auth_provider = auth_provider
+
+        if cassandra_config.certfile is not None and cassandra_config.usercert is not None and \
+           cassandra_config.userkey is not None:
+            ssl_context = SSLContext(PROTOCOL_TLSv1)
+            ssl_context.load_verify_locations(cassandra_config.certfile)
+            ssl_context.verify_mode = CERT_REQUIRED
+            ssl_context.load_cert_chain(
+                certfile=cassandra_config.usercert,
+                keyfile=cassandra_config.userkey)
+            self._ssl_context = ssl_context
 
         load_balancing_policy = WhiteListRoundRobinPolicy(ip_addresses)
         self._execution_profiles = {
@@ -66,31 +88,34 @@ class CqlSessionProvider(object):
 
         cluster = Cluster(contact_points=self._ip_addresses,
                           auth_provider=self._auth_provider,
-                          execution_profiles=self._execution_profiles)
+                          execution_profiles=self._execution_profiles,
+                          ssl_context=self._ssl_context)
 
         if retry:
             max_retries = 5
             attempts = 0
-            delay = 5
 
             while attempts < max_retries:
                 try:
                     session = cluster.connect()
-                    return CqlSession(session)
+                    return CqlSession(session, self._cassandra_config.resolve_ip_addresses)
                 except Exception as e:
                     logging.debug('Failed to create session', exc_info=e)
+                delay = 5 * (2 ** (attempts + 1))
                 time.sleep(delay)
                 attempts = attempts + 1
             raise Exception('Could not establish CQL session after {attempts}'.format(attempts=attempts))
         else:
             session = cluster.connect()
-            return CqlSession(session)
+            return CqlSession(session, self._cassandra_config.resolve_ip_addresses)
 
 
 class Nodetool(object):
 
     def __init__(self, cassandra_config):
         self._nodetool = ['nodetool']
+        if cassandra_config.nodetool_ssl == "true":
+            self._nodetool += ['--ssl']
         if cassandra_config.nodetool_username is not None:
             self._nodetool += ['-u', cassandra_config.nodetool_username]
         if cassandra_config.nodetool_password is not None:
@@ -110,8 +135,9 @@ class Nodetool(object):
 class CqlSession(object):
     EXCLUDED_KEYSPACES = ['system_traces']
 
-    def __init__(self, session):
+    def __init__(self, session, resolve_ip_addresses=True):
         self._session = session
+        self.hostname_resolver = HostnameResolver(resolve_ip_addresses)
 
     def __enter__(self):
         return self
@@ -141,13 +167,13 @@ class CqlSession(object):
 
     def datacenter(self):
         logging.debug('Checking datacenter...')
-        listen_address = self.cluster.contact_points[0]
+        listen_address = socket.gethostbyname(self.cluster.contact_points[0])
         token_map = self.cluster.metadata.token_map
 
         for host in token_map.token_to_host_owner.values():
-            socket_host = socket.gethostbyname(listen_address)
+            socket_host = self.hostname_resolver.resolve_fqdn(listen_address)
             logging.debug('Checking host {} against {}/{}'.format(host.address, listen_address, socket_host))
-            if host.address == listen_address or host.address == socket_host:
+            if host.address == listen_address or self.hostname_resolver.resolve_fqdn(host.address) == socket_host:
                 return host.datacenter
 
         raise RuntimeError('Unable to current datacenter')
@@ -173,7 +199,7 @@ class CqlSession(object):
         host_tokens_pairs = [(host, list(map(get_token, tokens))) for host, tokens in host_tokens_groups]
 
         return {
-            socket.gethostbyaddr(host.address)[0]: {
+            self.hostname_resolver.resolve_fqdn(host.address): {
                 'tokens': tokens,
                 'is_up': host.is_up
             }
@@ -205,11 +231,12 @@ class CassandraConfigReader(object):
         config_file = pathlib.Path(cassandra_config or self.DEFAULT_CASSANDRA_CONFIG)
         if not config_file.is_file():
             raise RuntimeError('{} is not a file'.format(config_file))
-        self._config = yaml.load(config_file.open(), Loader=yaml.BaseLoader)
+        with open(config_file, 'r') as f:
+            self._config = yaml.load(f, Loader=yaml.BaseLoader)
 
     @property
     def root(self):
-        data_file_directories = self._config.get('data_file_directories')
+        data_file_directories = self._config.get('data_file_directories', ['/var/lib/cassandra/data'])
         if not data_file_directories:
             raise RuntimeError('data_file_directories must be properly configured')
         if len(data_file_directories) > 1:
@@ -218,14 +245,14 @@ class CassandraConfigReader(object):
 
     @property
     def commitlog_directory(self):
-        commitlog_directory = self._config.get('commitlog_directory')
+        commitlog_directory = self._config.get('commitlog_directory', '/var/lib/cassandra/commitlog')
         if not commitlog_directory:
             raise RuntimeError('commitlog_directory must be properly configured')
         return pathlib.Path(commitlog_directory)
 
     @property
     def saved_caches_directory(self):
-        saved_caches_directory = self._config.get('saved_caches_directory')
+        saved_caches_directory = self._config.get('saved_caches_directory', '/var/lib/cassandra/saved_caches')
         if not saved_caches_directory:
             raise RuntimeError('saved_caches_directory must be properly configured')
         return pathlib.Path(saved_caches_directory)
@@ -236,24 +263,46 @@ class CassandraConfigReader(object):
             if self._config['listen_address']:
                 return self._config['listen_address']
 
-        return socket.gethostname()
+        return socket.gethostbyname(socket.getfqdn())
 
     @property
     def storage_port(self):
         if 'storage_port' in self._config:
             if self._config['storage_port']:
                 return self._config['storage_port']
-            else:
-                return "7000"
-        else:
-            return "7000"
+        return "7000"
+
+    @property
+    def native_port(self):
+        if 'native_transport_port' in self._config:
+            if self._config['native_transport_port']:
+                return self._config['native_transport_port']
+        return "9042"
+
+    @property
+    def rpc_port(self):
+        if 'rpc_port' in self._config:
+            if self._config['rpc_port']:
+                return self._config['rpc_port']
+        return "9160"
+
+    @property
+    def seeds(self):
+        seeds = list()
+        if 'seed_provider' in self._config:
+            if self._config['seed_provider']:
+                if self._config['seed_provider'][0]['class_name'].endswith('SimpleSeedProvider'):
+                    return self._config.get('seed_provider')[0]['parameters'][0]['seeds'].replace(' ', '').split(',')
+        return seeds
 
 
 class Cassandra(object):
 
     SNAPSHOT_PATTERN = '*/*/snapshots/{}'
+    SNAPSHOT_PREFIX = 'medusa-'
 
-    def __init__(self, cassandra_config, contact_point=None):
+    def __init__(self, config, contact_point=None):
+        cassandra_config = config.cassandra
         self._start_cmd = shlex.split(cassandra_config.start_cmd)
         self._stop_cmd = shlex.split(cassandra_config.stop_cmd)
         self._is_ccm = int(shlex.split(cassandra_config.is_ccm)[0])
@@ -262,16 +311,22 @@ class Cassandra(object):
         logging.warning('is ccm : {}'.format(self._is_ccm))
 
         config_reader = CassandraConfigReader(cassandra_config.config_file)
+        self._cassandra_config_file = cassandra_config.config_file
         self._root = config_reader.root
         self._commitlog_path = config_reader.commitlog_directory
         self._saved_caches_path = config_reader.saved_caches_directory
         self._hostname = contact_point if contact_point is not None else config_reader.listen_address
         self._cql_session_provider = CqlSessionProvider(
             [self._hostname],
-            username=cassandra_config.cql_username,
-            password=cassandra_config.cql_password
-        )
+            cassandra_config)
+
         self._storage_port = config_reader.storage_port
+        self._native_port = config_reader.native_port
+        self._rpc_port = config_reader.rpc_port
+        self.seeds = config_reader.seeds
+
+        self.grpc_config = config.grpc
+        self.kubernetes_config = config.kubernetes
 
     def _has_systemd(self):
         try:
@@ -300,8 +355,20 @@ class Cassandra(object):
         return self._saved_caches_path
 
     @property
+    def hostname(self):
+        return self._hostname
+
+    @property
     def storage_port(self):
         return self._storage_port
+
+    @property
+    def native_port(self):
+        return self._native_port
+
+    @property
+    def rpc_port(self):
+        return self._rpc_port
 
     class Snapshot(object):
         def __init__(self, parent, tag):
@@ -346,34 +413,68 @@ class Cassandra(object):
         def __repr__(self):
             return '{}<{}>'.format(self.__class__.__qualname__, self._tag)
 
-    def create_snapshot(self):
-        tag = 'medusa-{}'.format(uuid.uuid4())
-        cmd = self._nodetool.nodetool + ['snapshot', '-t', tag]
+    def create_snapshot(self, backup_name):
+        cmd = self.create_snapshot_command(backup_name)
+        tag = "{}{}".format(self.SNAPSHOT_PREFIX, backup_name)
+        if not self.snapshot_exists(tag):
 
-        if self._is_ccm == 1:
-            os.popen('ccm node1 nodetool \"snapshot -t {}\"'.format(tag)).read()
-        else:
-            logging.debug('Executing: {}'.format(' '.join(cmd)))
-            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, universal_newlines=True)
+            # TODO introduce abstraction layer/interface for invoking Cassandra
+            # Eventually I think we will want to introduce an abstraction layer for Cassandra's
+            # API that Medusa requires. There should be an implementation for using nodetool,
+            # one for Jolokia, and a 3rd for the management sidecard used by Cass Operator.
+            if medusa.utils.evaluate_boolean(self.kubernetes_config.enabled):
+                data = {
+                    "type": "exec",
+                    "mbean": "org.apache.cassandra.db:type=StorageService",
+                    "operation": "takeSnapshot(java.lang.String,java.util.Map,[Ljava.lang.String;)",
+                    "arguments": [tag, {}, []]
+                }
+                response = self.__do_post(data)
+                if response["status"] != 200:
+                    raise Exception("failed to create snapshot: {}".format(response["error"]))
+            else:
+                if self._is_ccm == 1:
+                    os.popen(cmd).read()
+                else:
+                    logging.debug('Executing: {}'.format(' '.join(cmd)))
+                    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, universal_newlines=True)
 
         return Cassandra.Snapshot(self, tag)
 
     def delete_snapshot(self, tag):
-        cmd = self._nodetool.nodetool + ['clearsnapshot', '-t', tag]
+        cmd = self.delete_snapshot_command(tag)
+        if self.snapshot_exists(tag):
 
-        if self._is_ccm == 1:
-            os.popen('ccm node1 nodetool \"clearsnapshot -t {}\"'.format(tag)).read()
-        else:
-            logging.debug('Executing: {}'.format(' '.join(cmd)))
-            try:
-                output = subprocess.check_output(cmd, universal_newlines=True)
-                logging.debug('nodetool output: %s', output)
-            except subprocess.CalledProcessError as e:
-                logging.debug('nodetool resulted in error: %s', e.output)
-                logging.warning(
-                    'Medusa may have failed at cleaning up snapshot %s. '
-                    'Check if the snapshot exists and clear it manually by running: %s',
-                    tag, ' '.join(cmd))
+            if medusa.utils.evaluate_boolean(self.kubernetes_config.enabled):
+                data = {
+                    "type": "exec",
+                    "mbean": "org.apache.cassandra.db:type=StorageService",
+                    "operation": "clearSnapshot",
+                    "arguments": [tag, []]
+                }
+                response = self.__do_post(data)
+                if response["status"] != 200:
+                    raise Exception("failed to delete snapshot: {}".format(response["error"]))
+            else:
+                if self._is_ccm == 1:
+                    os.popen(cmd).read()
+                else:
+                    logging.debug('Executing: {}'.format(' '.join(cmd)))
+                    try:
+                        output = subprocess.check_output(cmd, universal_newlines=True)
+                        logging.debug('nodetool output: {}'.format(output))
+                    except subprocess.CalledProcessError as e:
+                        logging.debug('nodetool resulted in error: {}'.format(e.output))
+                        logging.warning(
+                            'Medusa may have failed at cleaning up snapshot {}. '
+                            'Check if the snapshot exists and clear it manually '
+                            'by running: {}'.format(tag, ' '.join(cmd)))
+
+    def __do_post(self, data):
+        json_data = json.dumps(data)
+        response = requests.post(self.kubernetes_config.cassandra_url, data=json_data)
+
+        return json.loads(response.text)
 
     def list_snapshotnames(self):
         return {
@@ -393,6 +494,29 @@ class Cassandra(object):
             if snapshot.is_dir() and snapshot.name == tag:
                 return True
         return False
+
+    def create_snapshot_command(self, backup_name):
+        """
+        :param backup_name: string name of the medusa backup
+        :return: Array representation of a command to create a snapshot
+        """
+        tag = '{}{}'.format(self.SNAPSHOT_PREFIX, backup_name)
+        if self._is_ccm == 1:
+            cmd = 'ccm node1 nodetool \"snapshot -t {}\"'.format(tag)
+        else:
+            cmd = self._nodetool.nodetool + ['snapshot', '-t', tag]
+        return cmd
+
+    def delete_snapshot_command(self, tag):
+        """
+        :param tag: string snapshot name
+        :return: Array repesentation of a command to delete a snapshot
+        """
+        if self._is_ccm == 1:
+            cmd = 'ccm node1 nodetool \"clearsnapshot -t {}\"'.format(tag)
+        else:
+            cmd = self._nodetool.nodetool + ['clearsnapshot', '-t', tag]
+        return cmd
 
     def _columnfamily_path(self, keyspace_name, columnfamily_name, cf_id):
         root = pathlib.Path(self._root)
@@ -449,20 +573,8 @@ class Cassandra(object):
 
     def start(self, token_list):
         if self._is_ccm == 0:
-            jvm_opts = '-Dcassandra.initial_token={} -Dcassandra.auto_bootstrap=false'.format(','.join(token_list))
-            if self._os_has_systemd:
-                tokens_env = 'sudo systemctl set-environment JVM_OPTS="{}"'.format(jvm_opts)
-                cmd = '{} && {}'.format(tokens_env, ' '.join(shlex.quote(x) for x in self._start_cmd))
-            else:
-                tokens_env = 'sudo env JVM_OPTS="{}"'.format(jvm_opts)
-                # Have to use command line as Subprocess does not handle quotes well
-                # undoing 'shlex' split, back to a string in this case for '_start_cmd'
-                # joining the 2 pieces of the command
-                # Also, if the command to run cassandra uses sudo, we need to remove it
-                # to add it as the first element
-                if 'sudo' in self._start_cmd:
-                    self._start_cmd.remove('sudo')
-                cmd = '{} {}'.format(tokens_env, ' '.join(shlex.quote(x) for x in self._start_cmd))
+            self.replaceTokensInCassandraYamlAndDisableBootstrap(token_list)
+            cmd = '{}'.format(' '.join(shlex.quote(x) for x in self._start_cmd))
             logging.debug('Starting Cassandra with {}'.format(cmd))
             # run the command using 'shell=True' option
             # to interpret the string command well
@@ -470,30 +582,51 @@ class Cassandra(object):
         else:
             subprocess.check_output(self._start_cmd, shell=True)
 
+    def replaceTokensInCassandraYamlAndDisableBootstrap(self, token_list):
+        initial_token_line_found = False
+        auto_bootstrap_line_found = False
+        for line in fileinput.input(self._cassandra_config_file, inplace=True):
+            if (line.startswith("initial_token:")):
+                initial_token_line_found = True
+                print('initial_token: {}'.format(','.join(token_list)), end='\n')
+            elif (line.startswith("num_tokens:")):
+                print('num_tokens: {}'.format(len(token_list)), end='\n')
+            elif (line.startswith("auto_bootstrap:")):
+                auto_bootstrap_line_found = True
+                print('auto_bootstrap: false', end='\n')
+            else:
+                print('{}'.format(line), end='')
 
-def wait_for_node_to_come_up(config, host, retries=10, delay=6):
-    """
-        Polls the node until the health check passes.
+        if (not initial_token_line_found):
+            with open(self._cassandra_config_file, "a") as cassandra_yaml:
+                cassandra_yaml.write('\ninitial_token: {}'.format(','.join(token_list)))
 
-        :param health_check: The type of health check to perform, one of cql, thrift, all.
-        :param host: The target host on which to run the check
-        :param retries: The number of times to retry the health check. Defaults to 10
-        :param delay: A delay in seconds to wait before polling again. Defaults to 6 seconds.
-        :return: None when the node is determined to be up. If the retries are exhausted, an exception is raised.
-        """
+        if (not auto_bootstrap_line_found):
+            with open(self._cassandra_config_file, "a") as cassandra_yaml:
+                cassandra_yaml.write('\nauto_bootstrap: false')
 
-    logging.info('Waiting for Cassandra to come up on %s', host)
 
-    attempts = 0
-    while attempts < retries:
-        if is_node_up(config, host):
-            logging.info('Cassandra is up on %s', host)
-            return None
-        else:
-            time.sleep(delay)
-            attempts = attempts + 1
+@retry(stop_max_attempt_number=7, wait_exponential_multiplier=5000, wait_exponential_max=120000)
+def wait_for_node_to_come_up(config, host):
+    logging.info('Waiting for Cassandra to come up on {}'.format(host))
 
-    raise CassandraNodeNotUpError(host, attempts)
+    if not is_node_up(config, host):
+        raise CassandraNodeNotUpError(host)
+    else:
+        logging.info('Cassandra is up on {}'.format(host))
+        return True
+
+
+@retry(stop_max_attempt_number=7, wait_exponential_multiplier=5000, wait_exponential_max=120000)
+def wait_for_node_to_go_down(config, host):
+    logging.info('Waiting for Cassandra to go down on {}'.format(host))
+
+    if is_node_up(config, host):
+        # TODO can do a kill here
+        raise CassandraNodeNotDownError(host)
+    else:
+        logging.info('Cassandra is down {}'.format(host))
+        return True
 
 
 def is_node_up(config, host):
@@ -509,46 +642,73 @@ def is_node_up(config, host):
     must be ready to accept requests for both in order for the health check to be successful.
     """
 
+    health_check = config.checks.health_check
     if int(config.cassandra.is_ccm) == 1:
         args = ['ccm', 'node1', 'nodetool']
+        if health_check == 'thrift':
+            return is_ccm_up(args, 'statusthrift')
+        elif health_check == 'all':
+            return is_ccm_up(list(args), 'statusbinary') and is_ccm_up(list(args), 'statusthrift')
+        else:
+            return is_ccm_up(args, 'statusbinary')
     else:
-        args = Nodetool(config.cassandra).nodetool + ['-h', host]
+        cassandra = Cassandra(config)
+        native_port = cassandra.native_port
+        rpc_port = cassandra.rpc_port
+        if health_check == 'thrift':
+            return is_cassandra_up(host, rpc_port)
+        elif health_check == 'all':
+            return is_cassandra_up(host, rpc_port) and is_cassandra_up(host, native_port)
+        else:
+            # cql only
+            return is_cassandra_up(host, native_port)
 
-    health_check = config.restore.health_check
-    if health_check == 'cql':
-        return is_cql_up(args)
-    elif health_check == 'thrift':
-        return is_thrift_up(args)
-    elif health_check == 'all':
-        return is_cql_up(list(args)) and is_thrift_up(list(args))
-    else:
-        return is_cql_up(args)
 
-
-def is_cql_up(args):
+def is_ccm_up(args, nodetool_command):
     try:
-        args.append('statusbinary')
+        args.append(nodetool_command)
         output = subprocess.check_output(args, stderr=subprocess.STDOUT, universal_newlines=True)
-        return output.find('running') >= 0
+        # ccm returns either 'running' or 'not running'.
+        # Testing on finding 'running' is not enough!
+        if output.find('not running') == -1 and output.find('running') >= 0:
+            logging.debug('CCM native transport is now up')
+            return True
+        else:
+            logging.debug('CCM native transport is not up yet')
+            return False
     except subprocess.CalledProcessError as e:
-        # logging.debug('The native transport is not up yet %s', logging_suffix)
-        logging.debug('The native transport is not up yet', exc_info=e)
+        logging.debug('CCM native transport is not up yet', exc_info=e)
         return False
 
 
-def is_thrift_up(args):
+def is_open(host, port):
+    timeout = 3
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    is_accessible = False
     try:
-        args.append('statusthrift')
-        output = subprocess.check_output(args, stderr=subprocess.STDOUT, universal_newlines=True)
-        return output.find('running') >= 0
-    except subprocess.CalledProcessError:
-        logging.debug('The thrift server is not up yet')
-        return False
+        s.connect((host, port))
+        s.shutdown(socket.SHUT_RDWR)
+        is_accessible = True
+    except socket.error as e:
+        logging.debug('Port {} close on host {}'.format(port, host), exc_info=e)
+        is_accessible = False
+    finally:
+        s.close()
+        return is_accessible
+
+
+@retry(stop_max_attempt_number=5, wait_exponential_multiplier=5000, wait_exponential_max=120000)
+def is_cassandra_up(host, port):
+    if is_open(host, port):
+        return True
+    else:
+        logging.debug('The node {} is not up yet...'.format(host))
 
 
 class CassandraNodeNotUpError(Exception):
     """
-    Raised when it cannot be veriffied that a node is up by checking either nodetool statusbinary and/or
+    Raised when it cannot be verified that a node is up by checking either nodetool statusbinary and/or
     nodetool statusthrift
 
     Attributes:
@@ -556,6 +716,16 @@ class CassandraNodeNotUpError(Exception):
         attempts -- the number of times the check was performed
     """
 
-    def __init(self, host, attempts):
-        msg = 'Could not verify that Cassandra is up on {host} after {attempts}'.format(host=host, attempts=attempts)
+    def __init(self, host):
+        msg = 'Cassandra node {} is still down...'.format(host)
         super(CassandraNodeNotUpError, self).__init__(msg)
+
+
+class CassandraNodeNotDownError(Exception):
+    """
+    Raised when we give up waiting on a node to go down, meaning nodetool statusbinary and/or statusthrift keep
+    reporting open ports.
+    """
+    def __init(self, host):
+        msg = 'Cassandra node {} is still up...'.format(host)
+        super(CassandraNodeNotDownError, self).__init__(msg)

@@ -21,13 +21,14 @@ import traceback
 
 from datetime import datetime, timedelta
 
+import medusa.utils
 from medusa.index import clean_backup_from_index
 from medusa.monitoring import Monitoring
 from medusa.storage import Storage, format_bytes_str
 
 
 def main(config, max_backup_age=0, max_backup_count=0):
-    backups_to_purge = list()
+    backups_to_purge = set()
     monitoring = Monitoring(config=config.monitoring)
 
     try:
@@ -38,9 +39,9 @@ def main(config, max_backup_age=0, max_backup_count=0):
         backup_index = storage.list_backup_index_blobs()
         backups = list(storage.list_node_backups(fqdn=config.storage.fqdn, backup_index_blobs=backup_index))
         # list all backups to purge based on date conditions
-        backups_to_purge += backups_to_purge_by_age(backups, max_backup_age)
+        backups_to_purge |= set(backups_to_purge_by_age(backups, max_backup_age))
         # list all backups to purge based on count conditions
-        backups_to_purge += backups_to_purge_by_count(backups, max_backup_count)
+        backups_to_purge |= set(backups_to_purge_by_count(backups, max_backup_count))
         # purge all candidate backups
         purge_backups(storage, backups_to_purge)
 
@@ -84,7 +85,7 @@ def backups_to_purge_by_count(backups, max_backup_count):
 
 def purge_backups(storage, backups):
     """
-    Core function to purge a list of node_backups
+    Core function to purge a set of node_backups
     Used for node purge and backup delete (using a specific backup_name)
     """
     logging.info("{} backups are candidate to be purged".format(len(backups)))
@@ -199,8 +200,10 @@ def delete_backup(config, backup_name, all_nodes):
         tags = ['medusa-node-backup', 'delete-error', 'DELETE-ERROR']
         monitoring.send(tags, 0)
     except Exception as e:
-        traceback.print_exc()
         tags = ['medusa-node-backup', 'delete-error', 'DELETE-ERROR']
         monitoring.send(tags, 1)
-        logging.error('This error happened during the delete of backup "{}": {}'.format(backup_name, str(e)))
-        sys.exit(1)
+        medusa.utils.handle_exception(
+            e,
+            'This error happened during the delete of backup "{}": {}'.format(backup_name, str(e)),
+            config
+        )

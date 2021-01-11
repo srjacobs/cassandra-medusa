@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# Copyright 2020- Datastax, Inc. All rights reserved.
 # Copyright 2019 Spotify AB. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,35 +14,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pssh.clients.miko import ParallelSSHClient
-
 import collections
 import logging
 import sys
 import uuid
 import datetime
 import traceback
-import paramiko
+import socket
 
+import medusa.config
+import medusa.utils
 from medusa.monitoring import Monitoring
-from medusa.cassandra_utils import CqlSessionProvider
+from medusa.cassandra_utils import CqlSessionProvider, Cassandra
+from medusa.orchestration import Orchestration
 from medusa.schema import parse_schema
 from medusa.storage import Storage
 from medusa.verify_restore import verify_restore
+from medusa.network.hostname_resolver import HostnameResolver
 
 
 def orchestrate(config, backup_name, seed_target, temp_dir, host_list, keep_auth, bypass_checks,
-                verify, keyspaces, tables, pssh_pool_size, use_sstableloader=False):
+                verify, keyspaces, tables, parallel_restores, use_sstableloader=False):
     monitoring = Monitoring(config=config.monitoring)
     try:
         restore_start_time = datetime.datetime.now()
-        if seed_target is not None:
-            keep_auth = False
-
         if seed_target is None and host_list is None:
-            err_msg = 'You must either provide a seed target or a list of host'
-            logging.error(err_msg)
-            raise Exception(err_msg)
+            # if no target node is provided, nor a host list file, default to the local node as seed target
+            hostname_resolver = HostnameResolver(medusa.utils.evaluate_boolean(config.cassandra.resolve_ip_addresses))
+            seed_target = hostname_resolver.resolve_fqdn(socket.gethostbyname(socket.getfqdn()))
+            logging.warning("Seed target was not provided, using the local hostname: {}".format(seed_target))
 
         if seed_target is not None and host_list is not None:
             err_msg = 'You must either provide a seed target or a list of host, not both'
@@ -53,11 +54,6 @@ def orchestrate(config, backup_name, seed_target, temp_dir, host_list, keep_auth
             logging.error(err_msg)
             raise Exception(err_msg)
 
-        if keep_auth:
-            logging.info('system_auth keyspace will be left untouched on the target nodes')
-        else:
-            logging.info('system_auth keyspace will be overwritten with the backup on target nodes')
-
         storage = Storage(config=config.storage)
 
         try:
@@ -68,7 +64,7 @@ def orchestrate(config, backup_name, seed_target, temp_dir, host_list, keep_auth
             raise Exception(err_msg)
 
         restore = RestoreJob(cluster_backup, config, temp_dir, host_list, seed_target, keep_auth, verify,
-                             pssh_pool_size, keyspaces, tables, bypass_checks, use_sstableloader)
+                             parallel_restores, keyspaces, tables, bypass_checks, use_sstableloader)
         restore.execute()
 
         restore_end_time = datetime.datetime.now()
@@ -101,11 +97,12 @@ def expand_repeatable_option(option, values):
 
 class RestoreJob(object):
     def __init__(self, cluster_backup, config, temp_dir, host_list, seed_target, keep_auth, verify,
-                 pssh_pool_size, keyspaces={}, tables={}, bypass_checks=False, use_sstableloader=False):
+                 parallel_restores, keyspaces={}, tables={}, bypass_checks=False, use_sstableloader=False):
         self.id = uuid.uuid4()
         self.ringmap = None
         self.cluster_backup = cluster_backup
         self.session_provider = None
+        self.orchestration = Orchestration(config, parallel_restores)
         self.config = config
         self.host_list = host_list
         self.seed_target = seed_target
@@ -119,25 +116,25 @@ class RestoreJob(object):
         self.tables = tables
         self.bypass_checks = bypass_checks
         self.use_sstableloader = use_sstableloader
-        self.pssh_pool_size = pssh_pool_size
+        self.pssh_pool_size = parallel_restores
+        self.cassandra = Cassandra(config)
+        fqdn_resolver = medusa.utils.evaluate_boolean(self.config.cassandra.resolve_ip_addresses)
+        self.fqdn_resolver = HostnameResolver(fqdn_resolver)
 
     def execute(self):
         logging.info('Ensuring the backup is found and is complete')
         if not self.cluster_backup.is_complete():
             raise Exception('Backup is not complete')
 
-        # CASE 1 : We're restoring in place and a seed target has been provided
+        # CASE 1 : We're restoring using a seed target. Source/target mapping will be built based on tokenmap.
         if self.seed_target is not None:
-            logging.info('Restore will happen "In-Place", no new hardware is involved')
-            self.in_place = True
             self.session_provider = CqlSessionProvider([self.seed_target],
-                                                       username=self.config.cassandra.cql_username,
-                                                       password=self.config.cassandra.cql_password)
+                                                       self.config.cassandra)
 
             with self.session_provider.new_session() as session:
                 self._populate_ringmap(self.cluster_backup.tokenmap, session.tokenmap())
 
-        # CASE 2 : We're restoring out of place, i.e. doing a restore test
+        # CASE 2 : We're restoring a backup on a different cluster
         if self.host_list is not None:
             logging.info('Restore will happen on new hardware')
             self.in_place = False
@@ -145,58 +142,6 @@ class RestoreJob(object):
             logging.info('Starting Restore on all the nodes in this list: {}'.format(self.host_list))
 
         self._restore_data()
-
-    def _pssh_run(self, hosts, command, hosts_variables=None):
-        """
-        Runs a command on hosts list using cstar under the hood
-        There is no return made, to check the result there is a distinct function
-        Return: True (success) or False (error)
-        """
-        pssh_run_success = False
-        username = self.config.ssh.username if self.config.ssh.username != '' else None
-        port = self.config.ssh.port
-        pkey = None
-        if self.config.ssh.key_file is not None and self.config.ssh.key_file != '':
-            pkey = paramiko.RSAKey.from_private_key_file(self.config.ssh.key_file, None)
-
-        client = ParallelSSHClient(hosts,
-                                   forward_ssh_agent=True,
-                                   pool_size=self.pssh_pool_size,
-                                   user=username,
-                                   port=port,
-                                   pkey=pkey)
-        logging.info('Executing "{}" on all nodes.'
-                     .format(command))
-        output = client.run_command(command, host_args=hosts_variables, sudo=True)
-        client.join(output)
-
-        success = list(filter(lambda host_output: host_output.exit_code == 0,
-                       list(map(lambda host_output: host_output[1], output.items()))))
-        error = list(filter(lambda host_output: host_output.exit_code != 0,
-                     list(map(lambda host_output: host_output[1], output.items()))))
-
-        # Report on execution status
-        if len(success) == len(hosts):
-            logging.info('Job executing "{}" ran and finished Successfully on all nodes.'
-                         .format(command))
-            pssh_run_success = True
-        elif len(error) > 0:
-            logging.info('Job executing "{}" ran and finished with errors on following nodes: {}'
-                         .format(command, sorted(set(map(lambda host_output: host_output.host, error)))))
-            self.display_output(error)
-        else:
-            err_msg = 'Something unexpected happened while running pssh command'
-            logging.error(err_msg)
-            raise Exception(err_msg)
-
-        return pssh_run_success
-
-    def display_output(self, host_outputs):
-        for host_out in host_outputs:
-            for line in host_out.stdout:
-                logging.info("{}-stdout: {}".format(host_out.host, line))
-            for line in host_out.stderr:
-                logging.info("{}-stderr: {}".format(host_out.host, line))
 
     def _validate_ringmap(self, tokenmap, target_tokenmap):
         for host, ring_item in target_tokenmap.items():
@@ -213,7 +158,7 @@ class RestoreJob(object):
 
         def _token_counts_per_host(tokenmap):
             for host, ringitem in tokenmap.items():
-                yield len(ringitem['tokens'])
+                return len(ringitem['tokens'])
 
         def _hosts_from_tokenmap(tokenmap):
             hosts = set()
@@ -229,14 +174,31 @@ class RestoreJob(object):
                 groups[i % nb_chunks].append(my_list[i])
             return groups
 
+        target_tokens = {}
+        backup_tokens = {}
         topology_matches = self._validate_ringmap(tokenmap, target_tokenmap)
+        self.in_place = self._is_restore_in_place(tokenmap, target_tokenmap)
+        if self.in_place:
+            logging.info("Restoring on the same cluster that was the backup was taken on (in place fashion)")
+            self.keep_auth = False
+        else:
+            logging.info("Restoring on a different cluster than the backup one (remote fashion)")
+            if self.keep_auth:
+                logging.info('system_auth keyspace will be left untouched on the target nodes')
+            else:
+                # ops might not be aware of the underlying behavior towards auth. Let's ask what to do...
+                really_keep_auth = None
+                while (really_keep_auth != 'Y' and really_keep_auth != 'n') and not self.bypass_checks:
+                    really_keep_auth = input('Do you want to skip restoring the system_auth keyspace and keep the'
+                                             + ' credentials of the target cluster? (Y/n)')
+                self.keep_auth = True if really_keep_auth == 'Y' else False
 
         if topology_matches:
             target_tokens = {_tokens_from_ringitem(ringitem): host for host, ringitem in target_tokenmap.items()}
             backup_tokens = {_tokens_from_ringitem(ringitem): host for host, ringitem in tokenmap.items()}
 
-            target_tokens_per_host = set(_token_counts_per_host(tokenmap))
-            backup_tokens_per_host = set(_token_counts_per_host(target_tokenmap))
+            target_tokens_per_host = _token_counts_per_host(tokenmap)
+            backup_tokens_per_host = _token_counts_per_host(target_tokenmap)
 
             # we must have the same number of tokens per host in both vnode and normal clusters
             if target_tokens_per_host != backup_tokens_per_host:
@@ -247,21 +209,28 @@ class RestoreJob(object):
                 topology_matches = False
 
             # if not using vnodes, the tokens must match exactly
-            if len(backup_tokens_per_host) == 1 and target_tokens.keys() != backup_tokens.keys():
+            if backup_tokens_per_host == 1 and target_tokens.keys() != backup_tokens.keys():
                 extras = target_tokens.keys() ^ backup_tokens.keys()
                 logging.info('Tokenmap is differently distributed. Extra items: {}'.format(extras))
                 topology_matches = False
 
         if topology_matches:
             # We can associate each restore node with exactly one backup node
-            ringmap = collections.defaultdict(list)
-            for ring in backup_tokens, target_tokens:
-                for token, host in ring.items():
-                    ringmap[token].append(host)
+            backup_ringmap = collections.defaultdict(list)
+            target_ringmap = collections.defaultdict(list)
+            for token, host in backup_tokens.items():
+                backup_ringmap[token].append(host)
+            for token, host in target_tokens.items():
+                target_ringmap[token].append(host)
 
-            self.ringmap = ringmap
-            for token, hosts in ringmap.items():
-                self.host_map[hosts[1]] = {'source': [hosts[0]], 'seed': False}
+            self.ringmap = backup_ringmap
+            i = 0
+            for token, hosts in backup_ringmap.items():
+                # take the node that has the same token list or pick the one with the same position in the map.
+                restore_host = target_ringmap.get(token, list(target_ringmap.values())[i])[0]
+                isSeed = True if self.fqdn_resolver.resolve_fqdn(restore_host) in self._get_seeds_fqdn() else False
+                self.host_map[restore_host] = {'source': [hosts[0]], 'seed': isSeed}
+                i += 1
         else:
             # Topologies are different between backup and restore clusters. Using the sstableloader for restore.
             self.use_sstableloader = True
@@ -275,12 +244,24 @@ class RestoreJob(object):
                 # associate one restore host with several backups as we don't have the same number of nodes.
                 self.host_map[restore_hosts[i]] = {'source': grouped_backups[i], 'seed': False}
 
+    def _is_restore_in_place(self, backup_tokenmap, target_tokenmap):
+        # If at least one node is part of both tokenmaps, then we're restoring in place
+        # Otherwise we're restoring a remote cluster
+        return len(set(backup_tokenmap.keys()) & set(target_tokenmap.keys())) > 0
+
+    def _get_seeds_fqdn(self):
+        seeds = list()
+        for seed in self.cassandra.seeds:
+            seeds.append(self.fqdn_resolver.resolve_fqdn(seed))
+        return seeds
+
     def _populate_hostmap(self):
         with open(self.host_list, 'r') as f:
             for line in f.readlines():
                 seed, target, source = line.replace('\n', '').split(self.config.storage.host_file_separator)
                 # in python, bool('False') evaluates to True. Need to test the membership as below
-                self.host_map[target.strip()] = {'source': [source.strip()], 'seed': seed in ['True']}
+                self.host_map[self.fqdn_resolver.resolve_fqdn(target.strip())] \
+                    = {'source': [self.fqdn_resolver.resolve_fqdn(source.strip())], 'seed': seed in ['True']}
 
     def _restore_data(self):
         # create workdir on each target host
@@ -309,7 +290,8 @@ class RestoreJob(object):
         target_seeds = [t for t, s in self.host_map.items() if s['seed']]
         logging.info("target seeds : {}".format(target_seeds))
         # work out which nodes are seeds in the target cluster
-        target_hosts = self.host_map.keys()
+        target_hosts = [host for host in self.host_map.keys()]
+        logging.info("target hosts : {}".format(target_hosts))
 
         if self.use_sstableloader is False:
             # stop all target nodes
@@ -322,7 +304,7 @@ class RestoreJob(object):
             command = self.config.cassandra.stop_cmd
             logging.debug('Command to run is: {}'.format(command))
 
-            self._pssh_run(target_hosts, command, hosts_variables={})
+            self.orchestration.pssh_run(target_hosts, command, hosts_variables={})
 
         else:
             # we're using the sstableloader, which will require to (re)create the schema and empty the tables
@@ -340,9 +322,11 @@ class RestoreJob(object):
             seeds = '' if target in target_seeds or len(target_seeds) == 0 \
                     else '--seeds {}'.format(','.join(target_seeds))
             hosts_variables.append((','.join(source), seeds))
-            command = self._build_restore_cmd(target, source, seeds)
 
-        pssh_run_success = self._pssh_run(target_hosts, command, hosts_variables=hosts_variables)
+        command = self._build_restore_cmd()
+        pssh_run_success = self.orchestration.pssh_run(target_hosts,
+                                                       command,
+                                                       hosts_variables=hosts_variables)
 
         if not pssh_run_success:
             # we could implement a retry.
@@ -355,8 +339,8 @@ class RestoreJob(object):
         if self.verify:
             verify_restore(target_hosts, self.config)
 
-    def _build_restore_cmd(self, target, source, seeds):
-        in_place_option = '--in-place' if self.in_place else ''
+    def _build_restore_cmd(self):
+        in_place_option = '--in-place' if self.in_place else '--remote'
         keep_auth_option = '--keep-auth' if self.keep_auth else ''
         keyspace_options = expand_repeatable_option('keyspace', self.keyspaces)
         table_options = expand_repeatable_option('table', self.tables)
@@ -365,9 +349,9 @@ class RestoreJob(object):
         verify_option = '--no-verify'
 
         # %s placeholders in the below command will get replaced by pssh using per host command substitution
-        command = 'nohup sh -c "mkdir {work}; cd {work} && medusa-wrapper sudo medusa --fqdn=%s -vvv restore-node ' \
+        command = 'mkdir -p {work}; cd {work} && medusa-wrapper sudo medusa --fqdn=%s -vvv restore-node ' \
                   '{in_place} {keep_auth} %s {verify} --backup-name {backup} --temp-dir {temp_dir} ' \
-                  '{use_sstableloader} {keyspaces} {tables}"' \
+                  '{use_sstableloader} {keyspaces} {tables}' \
             .format(work=self.work_dir,
                     in_place=in_place_option,
                     keep_auth=keep_auth_option,
@@ -378,7 +362,7 @@ class RestoreJob(object):
                     keyspaces=keyspace_options,
                     tables=table_options)
 
-        logging.debug('Restoring on node {} with the following command {}'.format(target, command))
+        logging.debug('Preparing to restore on all nodes with the following command {}'.format(command))
 
         return command
 

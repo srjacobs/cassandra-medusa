@@ -14,15 +14,19 @@
 # limitations under the License.
 
 import configparser
+import shutil
 import tempfile
 import unittest
+import yaml
+import os
 
 from cassandra.metadata import Murmur3Token
 from pathlib import Path
 from unittest.mock import Mock
 
-from medusa.config import MedusaConfig, StorageConfig, CassandraConfig, _namedtuple_from_dict
-from medusa.cassandra_utils import CqlSession, SnapshotPath, Nodetool
+from medusa.config import MedusaConfig, StorageConfig, CassandraConfig, GrpcConfig, _namedtuple_from_dict,\
+    KubernetesConfig
+from medusa.cassandra_utils import CqlSession, SnapshotPath, Nodetool, Cassandra
 
 
 class CassandraUtilsTest(unittest.TestCase):
@@ -34,13 +38,24 @@ class CassandraUtilsTest(unittest.TestCase):
         config['storage'] = {
             'host_file_separator': ','
         }
+        config['cassandra'] = {
+            'resolve_ip_addresses': False
+        }
+        config["grpc"] = {
+            "enabled": "0"
+        }
+        config['kubernetes'] = {
+            "enabled": "0"
+        }
         self.config = MedusaConfig(
             storage=_namedtuple_from_dict(StorageConfig, config['storage']),
             monitoring={},
-            cassandra=None,
+            cassandra=_namedtuple_from_dict(CassandraConfig, config['cassandra']),
             ssh=None,
-            restore=None,
-            logging=None
+            checks=None,
+            logging=None,
+            grpc=_namedtuple_from_dict(GrpcConfig, config['grpc']),
+            kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes']),
         )
 
     def test_tokenmap_one_token(self):
@@ -53,10 +68,10 @@ class CassandraUtilsTest(unittest.TestCase):
         session.cluster.metadata.token_map.token_to_host_owner = {
             Murmur3Token(-9): host
         }
-        s = CqlSession(session)
+        s = CqlSession(session, resolve_ip_addresses=self.config.cassandra.resolve_ip_addresses)
         token_map = s.tokenmap()
         self.assertEqual(
-            {'localhost': {'is_up': True, 'tokens': [-9]}},
+            {'127.0.0.1': {'is_up': True, 'tokens': [-9]}},
             token_map
         )
 
@@ -72,10 +87,10 @@ class CassandraUtilsTest(unittest.TestCase):
             Murmur3Token(-6): host,
             Murmur3Token(0): host
         }
-        s = CqlSession(session)
+        s = CqlSession(session, resolve_ip_addresses=False)
         token_map = s.tokenmap()
-        self.assertEqual(True, token_map["localhost"]["is_up"])
-        self.assertEqual([-9, -6, 0], sorted(token_map["localhost"]["tokens"]))
+        self.assertEqual(True, token_map["127.0.0.1"]["is_up"])
+        self.assertEqual([-9, -6, 0], sorted(token_map["127.0.0.1"]["tokens"]))
 
     def test_tokenmap_two_dc(self):
         hostA = Mock()
@@ -95,10 +110,10 @@ class CassandraUtilsTest(unittest.TestCase):
             Murmur3Token(-6): hostA,
             Murmur3Token(6): hostB
         }
-        s = CqlSession(session)
+        s = CqlSession(session, resolve_ip_addresses=False)
         token_map = s.tokenmap()
         self.assertEqual(
-            {'localhost': {'is_up': True, 'tokens': [-6]}},
+            {'127.0.0.1': {'is_up': True, 'tokens': [-6]}},
             token_map
         )
 
@@ -126,13 +141,21 @@ class CassandraUtilsTest(unittest.TestCase):
         config = configparser.ConfigParser(interpolation=None)
         config['cassandra'] = {
         }
+        config["grpc"] = {
+            "enabled": "0"
+        }
+        config['kubernetes'] = {
+            "enabled": "0"
+        }
         medusa_config = MedusaConfig(
             storage=None,
             monitoring=None,
             cassandra=_namedtuple_from_dict(CassandraConfig, config['cassandra']),
             ssh=None,
-            restore=None,
-            logging=None
+            checks=None,
+            logging=None,
+            grpc=_namedtuple_from_dict(GrpcConfig, config['grpc']),
+            kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes']),
         )
         n = Nodetool(medusa_config.cassandra).nodetool
         self.assertEqual(n, ['nodetool'])
@@ -140,24 +163,248 @@ class CassandraUtilsTest(unittest.TestCase):
     def test_nodetool_command_with_parameters(self):
         config = configparser.ConfigParser(interpolation=None)
         config['cassandra'] = {
+            'nodetool_ssl': 'true',
             'nodetool_username': 'cassandra',
             'nodetool_password': 'password',
             'nodetool_password_file_path': '/etc/cassandra/jmx.password',
             'nodetool_host': '127.0.0.1',
             'nodetool_port': '7199'
         }
+        config["grpc"] = {
+            "enabled": "0"
+        }
+        config['kubernetes'] = {
+            "enabled": "0"
+        }
         medusa_config = MedusaConfig(
             storage=None,
             monitoring=None,
             cassandra=_namedtuple_from_dict(CassandraConfig, config['cassandra']),
             ssh=None,
-            restore=None,
-            logging=None
+            checks=None,
+            logging=None,
+            grpc=_namedtuple_from_dict(GrpcConfig, config['grpc']),
+            kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes']),
+        )
+        n = Nodetool(medusa_config.cassandra).nodetool
+        expected = ['nodetool', '--ssl', '-u', 'cassandra', '-pw', 'password', '-pwf', '/etc/cassandra/jmx.password',
+                    '-h', '127.0.0.1', '-p', '7199']
+        self.assertEqual(n, expected)
+
+    def test_nodetool_command_with_ssl_false(self):
+        config = configparser.ConfigParser(interpolation=None)
+        config['cassandra'] = {
+            'nodetool_ssl': 'false',
+            'nodetool_username': 'cassandra',
+            'nodetool_password': 'password',
+            'nodetool_password_file_path': '/etc/cassandra/jmx.password',
+            'nodetool_host': '127.0.0.1',
+            'nodetool_port': '7199'
+        }
+        config["grpc"] = {
+            "enabled": "0"
+        }
+        config['kubernetes'] = {
+            "enabled": "0"
+        }
+        medusa_config = MedusaConfig(
+            storage=None,
+            monitoring=None,
+            cassandra=_namedtuple_from_dict(CassandraConfig, config['cassandra']),
+            ssh=None,
+            checks=None,
+            logging=None,
+            grpc=_namedtuple_from_dict(GrpcConfig, config['grpc']),
+            kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes']),
         )
         n = Nodetool(medusa_config.cassandra).nodetool
         expected = ['nodetool', '-u', 'cassandra', '-pw', 'password', '-pwf', '/etc/cassandra/jmx.password',
                     '-h', '127.0.0.1', '-p', '7199']
         self.assertEqual(n, expected)
+
+    def test_yaml_token_enforcement_no_tokens(self):
+        with open('tests/resources/yaml/original/cassandra_no_tokens.yaml', 'r') as f:
+            shutil.copyfile('tests/resources/yaml/original/cassandra_no_tokens.yaml',
+                            'tests/resources/yaml/work/cassandra_no_tokens.yaml')
+        config = configparser.ConfigParser(interpolation=None)
+        config['cassandra'] = {
+            'config_file': os.path.join(os.path.dirname(__file__), 'resources/yaml/work/cassandra_no_tokens.yaml'),
+            'start_cmd': '/etc/init.d/cassandra start',
+            'stop_cmd': '/etc/init.d/cassandra stop',
+            'is_ccm': '1'
+        }
+        config["grpc"] = {
+            "enabled": "0"
+        }
+        config['kubernetes'] = {
+            "enabled": "0"
+        }
+        medusa_config = MedusaConfig(
+            storage=None,
+            monitoring=None,
+            cassandra=_namedtuple_from_dict(CassandraConfig, config['cassandra']),
+            ssh=None,
+            checks=None,
+            logging=None,
+            grpc=_namedtuple_from_dict(GrpcConfig, config['grpc']),
+            kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes']),
+        )
+
+        cassandra = Cassandra(medusa_config)
+        tokens = ['1', '2', '3']
+        cassandra.replaceTokensInCassandraYamlAndDisableBootstrap(tokens)
+
+        with open('tests/resources/yaml/work/cassandra_no_tokens.yaml', 'r') as f:
+            modified_yaml = yaml.load(f, Loader=yaml.BaseLoader)
+            self.assertEqual(modified_yaml.get('num_tokens'), '3')
+            self.assertEqual(modified_yaml.get('initial_token'), '1,2,3')
+            self.assertEqual(modified_yaml.get('auto_bootstrap'), 'false')
+
+    def test_yaml_token_enforcement_with_tokens(self):
+        with open('tests/resources/yaml/original/cassandra_with_tokens.yaml', 'r') as f:
+            shutil.copyfile('tests/resources/yaml/original/cassandra_with_tokens.yaml',
+                            'tests/resources/yaml/work/cassandra_with_tokens.yaml')
+        config = configparser.ConfigParser(interpolation=None)
+        config['cassandra'] = {
+            'config_file': os.path.join(os.path.dirname(__file__), 'resources/yaml/work/cassandra_with_tokens.yaml'),
+            'start_cmd': '/etc/init.d/cassandra start',
+            'stop_cmd': '/etc/init.d/cassandra stop',
+            'is_ccm': '1'
+        }
+        config["grpc"] = {
+            "enabled": "0"
+        }
+        config['kubernetes'] = {
+            "enabled": "0"
+        }
+        medusa_config = MedusaConfig(
+            storage=None,
+            monitoring=None,
+            cassandra=_namedtuple_from_dict(CassandraConfig, config['cassandra']),
+            ssh=None,
+            checks=None,
+            logging=None,
+            grpc=_namedtuple_from_dict(GrpcConfig, config['grpc']),
+            kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes']),
+        )
+
+        cassandra = Cassandra(medusa_config)
+        tokens = ['1', '2', '3']
+        cassandra.replaceTokensInCassandraYamlAndDisableBootstrap(tokens)
+
+        with open('tests/resources/yaml/work/cassandra_with_tokens.yaml', 'r') as f:
+            modified_yaml = yaml.load(f, Loader=yaml.BaseLoader)
+            self.assertEqual(modified_yaml.get('num_tokens'), '3')
+            self.assertEqual(modified_yaml.get('initial_token'), '1,2,3')
+            self.assertEqual(modified_yaml.get('auto_bootstrap'), 'false')
+
+    def test_yaml_token_enforcement_with_tokens_and_autobootstrap(self):
+        with open('tests/resources/yaml/original/cassandra_with_tokens.yaml', 'r') as f:
+            shutil.copyfile('tests/resources/yaml/original/cassandra_with_tokens_and_autobootstrap.yaml',
+                            'tests/resources/yaml/work/cassandra_with_tokens_and_autobootstrap.yaml')
+        config = configparser.ConfigParser(interpolation=None)
+        config['cassandra'] = {
+            'config_file': os.path.join(os.path.dirname(__file__),
+                                        'resources/yaml/work/cassandra_with_tokens_and_autobootstrap.yaml'),
+            'start_cmd': '/etc/init.d/cassandra start',
+            'stop_cmd': '/etc/init.d/cassandra stop',
+            'is_ccm': '1'
+        }
+        config["grpc"] = {
+            "enabled": "0"
+        }
+        config['kubernetes'] = {
+            "enabled": "0"
+        }
+        medusa_config = MedusaConfig(
+            storage=None,
+            monitoring=None,
+            cassandra=_namedtuple_from_dict(CassandraConfig, config['cassandra']),
+            ssh=None,
+            checks=None,
+            logging=None,
+            grpc=_namedtuple_from_dict(GrpcConfig, config['grpc']),
+            kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes']),
+        )
+
+        cassandra = Cassandra(medusa_config)
+        tokens = ['1', '2', '3']
+        cassandra.replaceTokensInCassandraYamlAndDisableBootstrap(tokens)
+
+        with open('tests/resources/yaml/work/cassandra_with_tokens_and_autobootstrap.yaml', 'r') as f:
+            modified_yaml = yaml.load(f, Loader=yaml.BaseLoader)
+            self.assertEqual(modified_yaml.get('num_tokens'), '3')
+            self.assertEqual(modified_yaml.get('initial_token'), '1,2,3')
+            self.assertEqual(modified_yaml.get('auto_bootstrap'), 'false')
+
+    def test_seed_parsing(self):
+        shutil.copyfile('tests/resources/yaml/original/cassandra_with_tokens_and_autobootstrap.yaml',
+                        'tests/resources/yaml/work/cassandra_with_tokens_and_autobootstrap.yaml')
+        config = configparser.ConfigParser(interpolation=None)
+        config['cassandra'] = {
+            'config_file': os.path.join(os.path.dirname(__file__),
+                                        'resources/yaml/work/cassandra_with_tokens_and_autobootstrap.yaml'),
+            'start_cmd': '/etc/init.d/cassandra start',
+            'stop_cmd': '/etc/init.d/cassandra stop',
+            'is_ccm': '1'
+        }
+        config["grpc"] = {
+            "enabled": "0"
+        }
+        config['kubernetes'] = {
+            "enabled": "0"
+        }
+        medusa_config = MedusaConfig(
+            storage=None,
+            monitoring=None,
+            cassandra=_namedtuple_from_dict(CassandraConfig, config['cassandra']),
+            ssh=None,
+            checks=None,
+            logging=None,
+            grpc=_namedtuple_from_dict(GrpcConfig, config['grpc']),
+            kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes']),
+        )
+
+        cassandra = Cassandra(medusa_config)
+        self.assertEqual(["127.0.0.1", "127.0.0.2"], sorted(cassandra.seeds))
+
+    def test_parsing_custom_seed_provider(self):
+        # patch a sample yaml to have a custom seed provider
+        with open('tests/resources/yaml/original/cassandra_with_tokens.yaml', 'r') as fi:
+            yaml_dict = yaml.load(fi, Loader=yaml.FullLoader)
+            yaml_dict['seed_provider'] = [
+                {'class_name': 'org.foo.bar.CustomSeedProvider'}
+            ]
+            with open('tests/resources/yaml/work/cassandra_with_custom_seedprovider.yaml', 'w') as fo:
+                yaml.safe_dump(yaml_dict, fo)
+
+        # pass the patched yaml to cassandra config
+        config = configparser.ConfigParser(interpolation=None)
+        config['cassandra'] = {
+            'config_file': os.path.join(os.path.dirname(__file__),
+                                        'resources/yaml/work/cassandra_with_custom_seedprovider.yaml'),
+            'start_cmd': '/etc/init.d/cassandra start',
+            'stop_cmd': '/etc/init.d/cassandra stop',
+            'is_ccm': '1'
+        }
+        config["grpc"] = {
+            "enabled": "0"
+        }
+        config['kubernetes'] = {
+            "enabled": "0"
+        }
+        medusa_config = MedusaConfig(
+            storage=None,
+            monitoring=None,
+            cassandra=_namedtuple_from_dict(CassandraConfig, config['cassandra']),
+            ssh=None,
+            checks=None,
+            logging=None,
+            grpc=_namedtuple_from_dict(GrpcConfig, config['grpc']),
+            kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes']),
+        )
+        cassandra = Cassandra(medusa_config)
+        self.assertEqual([], sorted(cassandra.seeds))
 
 
 if __name__ == '__main__':

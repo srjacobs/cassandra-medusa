@@ -14,80 +14,29 @@
 # limitations under the License.
 
 
-import base64
 import datetime
-import hashlib
 import json
 import logging
 import os
 import pathlib
 import psutil
-import sys
 import time
 import traceback
 
 from libcloud.storage.providers import Provider
 from retrying import retry
 
+import medusa.utils
 from medusa.cassandra_utils import Cassandra
 from medusa.index import add_backup_start_to_index, add_backup_finish_to_index, set_latest_backup_in_index
 from medusa.monitoring import Monitoring
 from medusa.storage.s3_storage import is_aws_s3
-from medusa.storage import Storage, format_bytes_str, ManifestObject
-
-
-BLOCK_SIZE_BYTES = 65536
-MULTIPART_PART_SIZE_IN_MB = 8
-MULTIPART_BLOCK_SIZE_BYTES = 65536
-MULTIPART_BLOCKS_PER_MB = 16
-
-
-def generate_md5_hash(src, block_size=BLOCK_SIZE_BYTES):
-
-    checksum = hashlib.md5()
-    with open(str(src), 'rb') as f:
-        # Incrementally read data and update the digest
-        while True:
-            read_data = f.read(block_size)
-            if not read_data:
-                break
-            checksum.update(read_data)
-
-    # Once we have all the data, compute checksum
-    checksum = checksum.digest()
-    # Convert into a bytes type that can be base64 encoded
-    base64_md5 = base64.encodebytes(checksum).decode('UTF-8').strip()
-    # Print the Base64 encoded CRC32C
-    return base64_md5
-
-
-def md5_multipart(src):
-    eof = False
-    hash_list = []
-    with open(str(src), 'rb') as f:
-        while eof is False:
-            (md5_hash, eof) = md5_part(f)
-            hash_list.append(md5_hash)
-
-    multipart_hash = hashlib.md5(b''.join(hash_list)).hexdigest()
-
-    return '%s-%d' % (multipart_hash, len(hash_list))
-
-
-def md5_part(f):
-    hash_md5 = hashlib.md5()
-    eof = False
-    for i in range(MULTIPART_PART_SIZE_IN_MB * MULTIPART_BLOCKS_PER_MB):
-        chunk = f.read(MULTIPART_BLOCK_SIZE_BYTES)
-        if chunk == b'':
-            eof = True
-            break
-        hash_md5.update(chunk)
-    return (hash_md5.digest(), eof)
+from medusa.storage.google_storage import GSUTIL_MAX_FILES_PER_CHUNK
+from medusa.storage import Storage, format_bytes_str, ManifestObject, divide_chunks
 
 
 class NodeBackupCache(object):
-    NEVER_BACKED_UP = ['manifest.json']
+    NEVER_BACKED_UP = ['manifest.json', 'schema.cql']
 
     def __init__(self, *, node_backup, differential_mode, storage_driver, storage_provider, storage_config):
         if node_backup:
@@ -136,20 +85,22 @@ class NodeBackupCache(object):
                 if self._storage_provider == Provider.GOOGLE_STORAGE or self._differential_mode is True:
                     cached_item = self._cached_objects.get(fqtn, {}).get(src.name)
 
-                if cached_item is None \
-                    or files_are_different(src,
-                                           cached_item,
-                                           self._storage_config.multi_part_upload_threshold,
-                                           self._storage_provider):
+                threshold = self._storage_config.multi_part_upload_threshold \
+                    if is_aws_s3(self._storage_provider) else None
+                if cached_item is None or not self._storage_driver.file_matches_cache(src, cached_item, threshold):
                     # We have no matching object in the cache matching the file
                     retained.append(src)
                 else:
                     # File was already present in the previous backup
                     # In case the backup isn't differential or the cache backup isn't differential, copy from cache
-                    if self._differential_mode is False or self._node_backup_cache_is_differential is False:
+                    if self._differential_mode is False and self._node_backup_cache_is_differential is False:
                         prefixed_path = '{}{}'.format(path_prefix, cached_item['path'])
                         cached_item_path = self._storage_driver.get_cache_path(prefixed_path)
                         retained.append(cached_item_path)
+                    # This backup is differential, but the cached one wasn't
+                    # We must re-upload the files according to the differential format
+                    elif self._differential_mode is True and self._node_backup_cache_is_differential is False:
+                        retained.append(src)
                     else:
                         # in case the backup is differential, we want to rule out files, not copy them from cache
                         manifest_object = self._make_manifest_object(path_prefix, cached_item)
@@ -162,21 +113,6 @@ class NodeBackupCache(object):
 
     def _make_manifest_object(self, path_prefix, cached_item):
         return ManifestObject('{}{}'.format(path_prefix, cached_item['path']), cached_item['size'], cached_item['MD5'])
-
-
-def files_are_different(src, cached_item, multi_part_upload_threshold, storage_provider):
-    multi_part_threshold = int(multi_part_upload_threshold) if multi_part_upload_threshold is not None else -1
-    if src.stat().st_size >= multi_part_threshold and multi_part_threshold > 0 and is_aws_s3(storage_provider):
-        md5_hash = md5_multipart(src)
-        b64_encoded_hash = ""
-    else:
-        md5_hash = generate_md5_hash(src)
-        b64_encoded_hash = base64.b64decode(md5_hash).hex()
-
-    return (src.stat().st_size != cached_item['size']
-            or (md5_hash != cached_item['MD5']  # single or multi part md5 hash. Used by S3 uploads.
-                and b64_encoded_hash != cached_item['MD5']  # b64 encoded md5 hash. Used by GCS.
-                and storage_provider != Provider.LOCAL))  # the local provider doesn't provide reliable hashes.
 
 
 def throttle_backup():
@@ -218,14 +154,13 @@ def stagger(fqdn, storage, tokenmap):
 
 
 def main(config, backup_name_arg, stagger_time, mode):
-
     start = datetime.datetime.now()
     backup_name = backup_name_arg or start.strftime('%Y%m%d%H')
     monitoring = Monitoring(config=config.monitoring)
 
     try:
         storage = Storage(config=config.storage)
-        cassandra = Cassandra(config.cassandra)
+        cassandra = Cassandra(config)
 
         differential_mode = False
         if mode == "differential":
@@ -246,9 +181,7 @@ def main(config, backup_name_arg, stagger_time, mode):
         except Exception:
             logging.warning("Throttling backup impossible. It's probable that ionice is not available.")
 
-        logging.info('Creating snapshot')
         logging.info('Saving tokenmap and schema')
-
         schema, tokenmap = get_schema_and_tokenmap(cassandra)
 
         node_backup.schema = schema
@@ -266,12 +199,12 @@ def main(config, backup_name_arg, stagger_time, mode):
                     time.sleep(60)
                 else:
                     raise IOError('Backups on previous nodes did not complete'
-                                  ' within our stagger time.'.format(backup_name))
+                                  ' within our stagger time.')
 
         actual_start = datetime.datetime.now()
 
         num_files, node_backup_cache = do_backup(
-            cassandra, node_backup, storage, differential_mode, config)
+            cassandra, node_backup, storage, differential_mode, config, backup_name)
 
         end = datetime.datetime.now()
         actual_backup_duration = end - actual_start
@@ -284,10 +217,11 @@ def main(config, backup_name_arg, stagger_time, mode):
     except Exception as e:
         tags = ['medusa-node-backup', 'backup-error', backup_name]
         monitoring.send(tags, 1)
-        logging.error('This error happened during the backup: {}'.format(str(e)))
-        traceback.print_exc()
-        sys.exit(1)
-
+        medusa.utils.handle_exception(
+            e,
+            "This error happened during the backup: {}".format(str(e)),
+            config
+        )
 
 # Wait 2^i * 10 seconds between each retry, up to 2 minutes between attempts, which is right after the
 # attempt on which it waited for 60 seconds
@@ -299,7 +233,8 @@ def get_schema_and_tokenmap(cassandra):
     return schema, tokenmap
 
 
-def do_backup(cassandra, node_backup, storage, differential_mode, config):
+def do_backup(cassandra, node_backup, storage, differential_mode,
+              config, backup_name):
 
     # Load last backup as a cache
     node_backup_cache = NodeBackupCache(
@@ -315,7 +250,8 @@ def do_backup(cassandra, node_backup, storage, differential_mode, config):
     # the cassandra snapshot we use defines __exit__ that cleans up the snapshot
     # so even if exception is thrown, a new snapshot will be created on the next run
     # this is not too good and we will use just one snapshot in the future
-    with cassandra.create_snapshot() as snapshot:
+    logging.info('Creating snapshot')
+    with cassandra.create_snapshot(backup_name) as snapshot:
         manifest = []
         num_files = backup_snapshots(storage, manifest, node_backup, node_backup_cache, snapshot)
 
@@ -369,31 +305,41 @@ def update_monitoring(actual_backup_duration, backup_name, monitoring, node_back
 
 
 def backup_snapshots(storage, manifest, node_backup, node_backup_cache, snapshot):
+    try:
+        num_files = 0
+        for snapshot_path in snapshot.find_dirs():
+            logging.debug("Backing up {}".format(snapshot_path))
 
-    num_files = 0
+            (needs_backup, already_backed_up) = node_backup_cache.replace_or_remove_if_cached(
+                keyspace=snapshot_path.keyspace,
+                columnfamily=snapshot_path.columnfamily,
+                srcs=list(snapshot_path.list_files()))
 
-    for snapshot_path in snapshot.find_dirs():
+            num_files += len(needs_backup) + len(already_backed_up)
 
-        (needs_backup, already_backed_up) = node_backup_cache.replace_or_remove_if_cached(
-            keyspace=snapshot_path.keyspace,
-            columnfamily=snapshot_path.columnfamily,
-            srcs=list(snapshot_path.list_files()))
+            dst_path = str(node_backup.datapath(keyspace=snapshot_path.keyspace,
+                                                columnfamily=snapshot_path.columnfamily))
+            logging.debug("destination path: {}".format(dst_path))
 
-        num_files += len(needs_backup) + len(already_backed_up)
+            manifest_objects = list()
+            if len(needs_backup) > 0:
+                # If there is a plenty of files to upload it should be
+                # splitted to batches due to 'gsutil cp' which
+                # can't handle too much source files via STDIN.
+                for src_batch in divide_chunks(needs_backup, GSUTIL_MAX_FILES_PER_CHUNK):
+                    manifest_objects += storage.storage_driver.upload_blobs(src_batch, dst_path)
 
-        dst_path = str(node_backup.datapath(keyspace=snapshot_path.keyspace, columnfamily=snapshot_path.columnfamily))
+            # Reintroducing already backed up objects in the manifest in differential
+            for obj in already_backed_up:
+                manifest_objects.append(obj)
 
-        manifest_objects = list()
-        if len(needs_backup) > 0:
-            manifest_objects = storage.storage_driver.upload_blobs(needs_backup, dst_path)
+            manifest.append(make_manifest_object(node_backup.fqdn, snapshot_path, manifest_objects, storage))
 
-        # Reintroducing already backed up objects in the manifest in differential
-        for obj in already_backed_up:
-            manifest_objects.append(obj)
-
-        manifest.append(make_manifest_object(node_backup.fqdn, snapshot_path, manifest_objects, storage))
-
-    return num_files
+        return num_files
+    except Exception as e:
+        logging.error('This error happened during the backup: {}'.format(str(e)))
+        traceback.print_exc()
+        raise e
 
 
 def make_manifest_object(fqdn, snapshot_path, manifest_objects, storage):

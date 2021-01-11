@@ -15,11 +15,15 @@
 # limitations under the License.
 
 from gevent import monkey
+
+import medusa.utils
+
 monkey.patch_all()
 import datetime
 import logging
 import logging.handlers
 import click
+from click_aliases import ClickAliasedGroup
 import sys
 
 # Need to get rid of the annoying pssh warning about paramiko
@@ -30,7 +34,8 @@ if not sys.warnoptions:
 from collections import defaultdict
 from pathlib import Path
 
-import medusa.backup
+import medusa.backup_node
+import medusa.backup_cluster
 import medusa.config
 import medusa.download
 import medusa.index
@@ -48,7 +53,7 @@ pass_MedusaConfig = click.make_pass_decorator(medusa.config.MedusaConfig)
 
 
 def configure_file_logging(config):
-    if not medusa.config.evaluate_boolean(config.enabled):
+    if not medusa.utils.evaluate_boolean(config.enabled):
         return
 
     logging.debug('Logging to file options: %s', config)
@@ -88,7 +93,7 @@ def configure_console_logging(verbosity, without_log_timestamp):
             logging.getLogger(loggername).setLevel(logging.CRITICAL)
 
 
-@click.group()
+@click.group(cls=ClickAliasedGroup)
 @click.option('-v', '--verbosity', help='Verbosity', default=0, count=True)
 @click.option('--without-log-timestamp', help='Do not show timestamp in logs', default=False, is_flag=True)
 @click.option('--config-file', help='Specify config file')
@@ -107,17 +112,40 @@ def cli(ctx, verbosity, without_log_timestamp, config_file, **kwargs):
     configure_file_logging(ctx.obj.logging)
 
 
-@cli.command(name='backup')
+@cli.command(aliases=['backup', 'backup-node'])
 @click.option('--backup-name', help='Custom name for the backup')
-@click.option('--stagger', default=None, type=int, help='Check for staggering initial backups for duration seconds')
+@click.option('--stagger', default=None, type=int, help='Drop initial backups if longer than a duration in seconds')
 @click.option('--mode', default="differential", type=click.Choice(['full', 'differential']))
 @pass_MedusaConfig
 def backup(medusaconfig, backup_name, stagger, mode):
     """
-    Backup Cassandra
+    Backup single Cassandra node
     """
     stagger_time = datetime.timedelta(seconds=stagger) if stagger else None
-    medusa.backup.main(medusaconfig, backup_name, stagger_time, mode)
+    medusa.backup_node.main(medusaconfig, backup_name, stagger_time, mode)
+
+
+@cli.command(name='backup-cluster')
+@click.option('--backup-name', help='Backup name', required=True)
+@click.option('--stagger', default=None, type=int, help='Drop initial backups if longer than a duration in seconds')
+@click.option('--mode', default="differential", type=click.Choice(['full', 'differential']))
+@click.option('--temp-dir', help='Directory for temporary storage', default="/tmp")
+@click.option('--parallel-snapshots', '-ps', help="Number of concurrent synchronous (blocking) "
+                                                  "ssh sessions started by pssh", default=500)
+@click.option('--parallel-uploads', '-pu', help="Number of concurrent synchronous (blocking) "
+                                                "ssh sessions started by pssh", default=1)
+@pass_MedusaConfig
+def backup_cluster(medusaconfig, backup_name, stagger, mode, temp_dir, parallel_snapshots, parallel_uploads):
+    """
+    Backup Cassandra cluster
+    """
+    medusa.backup_cluster.orchestrate(medusaconfig,
+                                      backup_name,
+                                      stagger,
+                                      mode,
+                                      Path(temp_dir),
+                                      int(parallel_snapshots),
+                                      int(parallel_uploads))
 
 
 @cli.command(name='fetch-tokenmap')
@@ -125,7 +153,7 @@ def backup(medusaconfig, backup_name, stagger, mode):
 @pass_MedusaConfig
 def fetch_tokenmap(medusaconfig, backup_name):
     """
-    Backup Cassandra
+    Get the token/node mapping for a specific backup
     """
     medusa.fetch_tokenmap.main(medusaconfig, backup_name)
 
@@ -143,12 +171,19 @@ def list_backups(medusaconfig, show_all):
 @cli.command(name='download')
 @click.option('--backup-name', help='Custom name for the backup', required=True)
 @click.option('--download-destination', help='Download destination', required=True)
+@click.option('--keyspace', 'keyspaces', help="Restore tables from this keyspace, use --keyspace ks1 [--keyspace ks2]",
+              multiple=True, default={})
+@click.option('--table', 'tables', help="Restore only this table, use --table ks.t1 [--table ks.t2]",
+              multiple=True, default={})
+@click.option('--ignore-system-keyspaces', help='Do not download cassandra system keyspaces', required=True,
+              is_flag=True, default=False)
 @pass_MedusaConfig
-def download(medusaconfig, backup_name, download_destination):
+def download(medusaconfig, backup_name, download_destination, keyspaces, tables, ignore_system_keyspaces):
     """
     Download backup
     """
-    medusa.download.download_cmd(medusaconfig, backup_name, Path(download_destination))
+    medusa.download.download_cmd(medusaconfig, backup_name, Path(download_destination), keyspaces, tables,
+                                 ignore_system_keyspaces)
 
 
 @cli.command(name='restore-cluster')
@@ -156,19 +191,22 @@ def download(medusaconfig, backup_name, download_destination):
 @click.option('--seed-target', help='seed of the target hosts', required=False)
 @click.option('--temp-dir', help='Directory for temporary storage', default="/tmp")
 @click.option('--host-list', help='List of nodes to restore with the associated target host', required=False)
-@click.option('--keep-auth/--overwrite-auth', help='Keep/overwrite system_auth as found on the nodes', default=True)
+@click.option('--keep-auth', help='Keep system_auth as found on the nodes', default=False, is_flag=True)
 @click.option('-y', '--bypass-checks', help='Bypasses the security check for restoring a cluster',
               default=False, is_flag=True)
 @click.option('--verify/--no-verify', help='Verify that the cluster is operational after the restore completes,',
               default=False)
-@click.option('--keyspace', 'keyspaces', help="Restore tables from this keyspace", multiple=True, default={})
-@click.option('--table', 'tables', help="Restore only this table", multiple=True, default={})
+@click.option('--keyspace', 'keyspaces', help="Restore tables from this keyspace, use --keyspace ks1 [--keyspace ks2]",
+              multiple=True, default={})
+@click.option('--table', 'tables', help="Restore only this table, use --table ks.t1 [--table ks.t2]",
+              multiple=True, default={})
 @click.option('--use-sstableloader', help='Use the sstableloader to load the backup into the cluster',
               default=False, is_flag=True)
-@click.option('--pssh-pool-size', help="Number of concurrent ssh sessions started by pssh", default=10)
+@click.option('--parallel-restores', '-pr', help="Number of concurrent synchronous (blocking) "
+                                                 "ssh sessions started by pssh", default=500)
 @pass_MedusaConfig
 def restore_cluster(medusaconfig, backup_name, seed_target, temp_dir, host_list, keep_auth, bypass_checks,
-                    verify, keyspaces, tables, use_sstableloader, pssh_pool_size):
+                    verify, keyspaces, tables, parallel_restores, use_sstableloader):
     """
     Restore Cassandra cluster
     """
@@ -182,23 +220,25 @@ def restore_cluster(medusaconfig, backup_name, seed_target, temp_dir, host_list,
                                        verify,
                                        set(keyspaces),
                                        set(tables),
-                                       int(pssh_pool_size),
+                                       int(parallel_restores),
                                        use_sstableloader)
 
 
 @cli.command(name='restore-node')
 @click.option('--temp-dir', help='Directory for temporary storage', default="/tmp")
 @click.option('--backup-name', help='Backup name', required=True)
-@click.option('--in-place', help='Indicates if the restore happens on the node the backup was done on.',
-              default=False, is_flag=True)
+@click.option('--in-place/--remote', help='Indicates if the restore happens on the node the backup was done on.',
+              default=True, is_flag=True)
 @click.option('--keep-auth', help='Keep system_auth keyspace as found on the node',
               default=False, is_flag=True)
 @click.option('--seeds', help='Nodes to wait for after downloading backup but before starting C*',
               default=None)
 @click.option('--verify/--no-verify', help='Verify that the cluster is operational after the restore completes,',
               default=False)
-@click.option('--keyspace', 'keyspaces', help="Restore tables from this keyspace", multiple=True, default={})
-@click.option('--table', 'tables', help="Restore only this table", multiple=True, default={})
+@click.option('--keyspace', 'keyspaces', help="Restore tables from this keyspace, use --keyspace ks1 [--keyspace ks2]",
+              multiple=True, default={})
+@click.option('--table', 'tables', help="Restore only this table, use --table ks.t1 [--table ks.t2]",
+              multiple=True, default={})
 @click.option('--use-sstableloader', help='Use the sstableloader to load the backup into the cluster',
               default=False, is_flag=True)
 @pass_MedusaConfig

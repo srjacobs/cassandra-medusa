@@ -29,8 +29,9 @@ from pathlib import Path
 from subprocess import PIPE
 import signal
 from cassandra.cluster import Cluster
+from ssl import SSLContext, PROTOCOL_TLSv1, CERT_REQUIRED
 
-import medusa.backup
+import medusa.backup_node
 import medusa.index
 import medusa.listing
 import medusa.purge
@@ -38,6 +39,7 @@ import medusa.report_latest
 import medusa.restore_node
 import medusa.status
 import medusa.verify
+import medusa.service.grpc.client
 
 from medusa.config import (
     MedusaConfig,
@@ -45,12 +47,20 @@ from medusa.config import (
     CassandraConfig,
     MonitoringConfig,
     ChecksConfig,
+    GrpcConfig,
+    KubernetesConfig,
 )
 from medusa.config import _namedtuple_from_dict
 from medusa.storage import Storage
 from medusa.monitoring import LocalMonitoring
 
 storage_prefix = "{}-{}".format(datetime.datetime.now().isoformat(), str(uuid.uuid4()))
+os.chdir("..")
+certfile = "{}/resources/local_with_ssl/rootCa.crt".format(os.getcwd())
+usercert = "{}/resources/local_with_ssl/client.pem".format(os.getcwd())
+userkey = "{}/resources/local_with_ssl/client.key.pem".format(os.getcwd())
+keystore_path = "{}/resources/local_with_ssl/127.0.0.1.jks".format(os.getcwd())
+trustore_path = "{}/resources/local_with_ssl/generic-server-truststore.jks".format(os.getcwd())
 
 
 def kill_cassandra():
@@ -72,18 +82,103 @@ def cleanup_storage(context, storage_provider):
         if os.path.isdir(os.path.join("/tmp", "medusa_it_bucket")):
             shutil.rmtree(os.path.join("/tmp", "medusa_it_bucket"))
         os.makedirs(os.path.join("/tmp", "medusa_it_bucket"))
-    elif storage_provider == "google_storage" or storage_provider.find("s3") == 0:
+    else:
         storage = Storage(config=context.medusa_config.storage)
         objects = storage.storage_driver.list_objects(storage._prefix)
         for obj in objects:
             storage.storage_driver.delete_object(obj)
 
 
-@given(r'I have a fresh ccm cluster running named "{cluster_name}"')
-def _i_have_a_fresh_ccm_cluster_running(context, cluster_name):
-    context.cassandra_version = "2.2.14"
+class GRPCServer:
+    @staticmethod
+    def init(config):
+        server = GRPCServer(config)
+        server.start()
+        return server
+
+    @staticmethod
+    def destroy():
+        p = subprocess.Popen(["ps", "-Af"], stdout=subprocess.PIPE)
+        out, err = p.communicate()
+        for line in out.splitlines():
+            if b"medusa.service.grpc.server server.py" in line:
+                logging.info(line)
+                pid = int(line.split(None, 2)[1])
+                os.kill(pid, signal.SIGKILL)
+
+        if os.path.isdir(os.path.join("/tmp", "medusa_grpc")):
+            shutil.rmtree(os.path.join("/tmp", "medusa_grpc"))
+
+    def __init__(self, config):
+        self.config = config
+        self.medusa_conf_file = "/tmp/medusa_grpc/medusa.ini"
+
+    def start(self):
+        os.makedirs(os.path.join("/tmp", "medusa_grpc"))
+
+        with open(self.medusa_conf_file, "w") as config_file:
+            self.config.write(config_file)
+            cmd = ["python3", "-m", "medusa.service.grpc.server", "server.py", self.medusa_conf_file]
+            subprocess.Popen(cmd, cwd=os.path.abspath("../"))
+
+
+@given(r'I have a fresh ccm cluster "{client_encryption}" running named "{cluster_name}"')
+def _i_have_a_fresh_ccm_cluster_running(context, cluster_name, client_encryption):
     context.session = None
     context.cluster_name = cluster_name
+    is_client_encryption_enable = False
+    subprocess.run(["ccm", "stop"], stdout=PIPE, stderr=PIPE)
+    kill_cassandra()
+    res = subprocess.run(
+        ["ccm", "switch", context.cluster_name], stdout=PIPE, stderr=PIPE
+    )
+    if b"does not appear to be a valid cluster" not in res.stderr:
+        subprocess.check_call(
+            ["ccm", "remove", context.cluster_name], stdout=PIPE, stderr=PIPE
+        )
+    subprocess.check_call(
+        [
+            "ccm",
+            "create",
+            context.cluster_name,
+            "-v",
+            context.cassandra_version,
+            "-n",
+            "1",
+        ]
+    )
+
+    os.popen("ccm node1 updateconf 'storage_port: 7011'").read()
+
+    if client_encryption == 'with_client_encryption':
+        is_client_encryption_enable = True
+        update_client_encrytion_opts = "ccm node1 updateconf -y 'client_encryption_options: { enabled: true,\
+        optional: false,keystore: " + keystore_path + ",keystore_password: testdata1,\
+        require_client_auth: true,truststore: " + trustore_path + ",truststore_password: truststorePass1,\
+        protocol: TLS,algorithm: SunX509,store_type: JKS,cipher_suites: [TLS_RSA_WITH_AES_256_CBC_SHA]}'"
+        os.popen(update_client_encrytion_opts).read()
+
+    if os.uname().sysname == "Linux":
+        os.popen(
+            """sed -i 's/#MAX_HEAP_SIZE="4G"/MAX_HEAP_SIZE="256m"/' ~/.ccm/"""
+            + context.cluster_name
+            + """/node1/conf/cassandra-env.sh"""
+        ).read()
+        os.popen(
+            """sed -i 's/#HEAP_NEWSIZE="800M"/HEAP_NEWSIZE="200M"/' ~/.ccm/"""
+            + context.cluster_name
+            + """/node1/conf/cassandra-env.sh"""
+        ).read()
+    os.popen("LOCAL_JMX=yes ccm start --no-wait").read()
+    context.session = connect_cassandra(is_client_encryption_enable)
+
+
+@given(r'I have a fresh ccm cluster with jolokia "{client_encryption}" running named "{cluster_name}"')
+def _i_have_a_fresh_ccm_cluster_with_jolokia_running(context, cluster_name, client_encryption):
+    context.cassandra_version = "3.11.6"
+    context.session = None
+    context.cluster_name = cluster_name
+    is_client_encryption_enable = False
     subprocess.run(["ccm", "stop"], stdout=PIPE, stderr=PIPE)
     kill_cassandra()
     res = subprocess.run(
@@ -106,6 +201,22 @@ def _i_have_a_fresh_ccm_cluster_running(context, cluster_name):
     )
 
     os.popen("ccm node1 updateconf 'storage_port: 7011'").read()
+
+    if client_encryption == 'with_client_encryption':
+        is_client_encryption_enable = True
+        update_client_encrytion_opts = "ccm node1 updateconf -y 'client_encryption_options: { enabled: true,\
+        optional: false,keystore: " + keystore_path + ",keystore_password: testdata1,\
+        require_client_auth: true,truststore: " + trustore_path + ",truststore_password: truststorePass1,\
+        protocol: TLS,algorithm: SunX509,store_type: JKS,cipher_suites: [TLS_RSA_WITH_AES_256_CBC_SHA]}'"
+        os.popen(update_client_encrytion_opts).read()
+
+    conf_file = os.path.expanduser("~/.ccm/{}/node1/conf/cassandra-env.sh".format(context.cluster_name))
+    with open(conf_file, "a") as config_file:
+        config_file.write(
+            'JVM_OPTS="$JVM_OPTS -javaagent:/tmp/jolokia-jvm-1.6.2-agent.jar=port=8778,host=127.0.0.1"'
+        )
+    shutil.copyfile("resources/grpc/jolokia-jvm-1.6.2-agent.jar", "/tmp/jolokia-jvm-1.6.2-agent.jar")
+
     if os.uname().sysname == "Linux":
         os.popen(
             """sed -i 's/#MAX_HEAP_SIZE="4G"/MAX_HEAP_SIZE="256m"/' ~/.ccm/"""
@@ -118,11 +229,11 @@ def _i_have_a_fresh_ccm_cluster_running(context, cluster_name):
             + """/node1/conf/cassandra-env.sh"""
         ).read()
     os.popen("LOCAL_JMX=yes ccm start --no-wait").read()
-    context.session = connect_cassandra()
+    context.session = connect_cassandra(is_client_encryption_enable)
 
 
-@given(r'I am using "{storage_provider}" as storage provider')
-def i_am_using_storage_provider(context, storage_provider):
+@given(r'I am using "{storage_provider}" as storage provider in ccm cluster "{client_encryption}"')
+def i_am_using_storage_provider(context, storage_provider, client_encryption):
     logging.info("Starting the tests")
     if not hasattr(context, "cluster_name"):
         context.cluster_name = "test"
@@ -138,7 +249,7 @@ def i_am_using_storage_provider(context, storage_provider):
             "bucket_name": "medusa_it_bucket",
             "key_file": "",
             "storage_provider": "local",
-            "fqdn": "localhost",
+            "fqdn": "127.0.0.1",
             "api_key_or_username": "",
             "api_secret_or_password": "",
             "base_path": "/tmp",
@@ -147,10 +258,158 @@ def i_am_using_storage_provider(context, storage_provider):
     elif storage_provider == "google_storage":
         config["storage"] = {
             "host_file_separator": ",",
-            "bucket_name": "medusa_it_bucket",
+            "bucket_name": "medusa-integration-tests",
             "key_file": "~/medusa_credentials.json",
             "storage_provider": "google_storage",
-            "fqdn": "localhost",
+            "fqdn": "127.0.0.1",
+            "api_key_or_username": "",
+            "api_secret_or_password": "",
+            "base_path": "/tmp",
+            "prefix": storage_prefix
+        }
+    elif storage_provider == "azure_blobs":
+        config["storage"] = {
+            "host_file_separator": ",",
+            "bucket_name": "medusa-integration-tests",
+            "key_file": "~/medusa_azure_credentials.json",
+            "storage_provider": "azure_blobs",
+            "fqdn": "127.0.0.1",
+            "api_key_or_username": "",
+            "api_secret_or_password": "",
+            "base_path": "/tmp",
+            "concurrent_transfers": 4,
+            "multi_part_upload_threshold": 1 * 1024,
+            "prefix": storage_prefix
+        }
+    elif storage_provider.startswith("s3"):
+        config["storage"] = {
+            "host_file_separator": ",",
+            "bucket_name": "tlp-medusa-dev",
+            "key_file": "~/.aws/credentials",
+            "storage_provider": storage_provider,
+            "fqdn": "127.0.0.1",
+            "api_key_or_username": "",
+            "api_secret_or_password": "",
+            "api_profile": "default",
+            "base_path": "/tmp",
+            "multi_part_upload_threshold": 1 * 1024,
+            "concurrent_transfers": 4,
+            "prefix": storage_prefix,
+            "aws_cli_path": "aws"
+        }
+    elif storage_provider.startswith("ibm"):
+        config["storage"] = {
+            "host_file_separator": ",",
+            "bucket_name": "medusa-experiment-2",
+            "key_file": "~/.aws/ibm_credentials",
+            "storage_provider": storage_provider,
+            "fqdn": "127.0.0.1",
+            "api_key_or_username": "",
+            "api_secret_or_password": "",
+            "api_profile": "default",
+            "base_path": "/tmp",
+            "multi_part_upload_threshold": 1 * 1024,
+            "concurrent_transfers": 4,
+            "prefix": storage_prefix,
+            "aws_cli_path": "aws",
+            "region": "eu-smart",
+            "transfer_max_bandwidth": "1MB/s"
+        }
+
+    config["cassandra"] = {
+        "is_ccm": 1,
+        "stop_cmd": "ccm stop",
+        "start_cmd": "ccm start",
+        "cql_username": "cassandra",
+        "cql_password": "cassandra",
+        "config_file": os.path.expanduser(
+            os.path.join(
+                "~/.ccm", context.cluster_name, "node1", "conf", "cassandra.yaml"
+            )
+        ),
+        "sstableloader_bin": os.path.expanduser(
+            os.path.join(
+                "~/.ccm",
+                "repository",
+                context.cassandra_version,
+                "bin",
+                "sstableloader",
+            )
+        ),
+        "resolve_ip_addresses": False
+    }
+
+    if client_encryption == 'with_client_encryption':
+        config["cassandra"].update(
+            {
+                "certfile": certfile,
+                "usercert": usercert,
+                "userkey": userkey,
+                "sstableloader_ts": trustore_path,
+                "sstableloader_tspw": "truststorePass1",
+                "sstableloader_ks": keystore_path,
+                "sstableloader_kspw": "testdata1"
+            }
+        )
+
+    config["monitoring"] = {"monitoring_provider": "local"}
+
+    config["checks"] = {
+        "health_check": "cql"
+    }
+
+    config["grpc"] = {
+        "enabled": "0"
+    }
+
+    config['kubernetes'] = {
+        "enabled": "0"
+    }
+
+    context.medusa_config = MedusaConfig(
+        storage=_namedtuple_from_dict(StorageConfig, config["storage"]),
+        cassandra=_namedtuple_from_dict(CassandraConfig, config["cassandra"]),
+        monitoring=_namedtuple_from_dict(MonitoringConfig, config["monitoring"]),
+        ssh=None,
+        checks=_namedtuple_from_dict(ChecksConfig, config["checks"]),
+        logging=None,
+        grpc=_namedtuple_from_dict(GrpcConfig, config["grpc"]),
+        kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes']),
+    )
+    cleanup_storage(context, storage_provider)
+    cleanup_monitoring(context)
+
+
+@given(r'I am using "{storage_provider}" as storage provider in ccm cluster "{client_encryption}" with gRPC server')
+def i_am_using_storage_provider_with_grpc_server(context, storage_provider, client_encryption):
+    logging.info("Starting the tests")
+    if not hasattr(context, "cluster_name"):
+        context.cluster_name = "test"
+    config = configparser.ConfigParser(interpolation=None)
+
+    if storage_provider == "local":
+        if os.path.isdir(os.path.join("/tmp", "medusa_it_bucket")):
+            shutil.rmtree(os.path.join("/tmp", "medusa_it_bucket"))
+        os.makedirs(os.path.join("/tmp", "medusa_it_bucket"))
+
+        config["storage"] = {
+            "host_file_separator": ",",
+            "bucket_name": "medusa_it_bucket",
+            "key_file": "",
+            "storage_provider": "local",
+            "fqdn": "127.0.0.1",
+            "api_key_or_username": "",
+            "api_secret_or_password": "",
+            "base_path": "/tmp",
+            "prefix": storage_prefix
+        }
+    elif storage_provider == "google_storage":
+        config["storage"] = {
+            "host_file_separator": ",",
+            "bucket_name": "medusa-integration-tests",
+            "key_file": "~/medusa_credentials.json",
+            "storage_provider": "google_storage",
+            "fqdn": "127.0.0.1",
             "api_key_or_username": "",
             "api_secret_or_password": "",
             "base_path": "/tmp",
@@ -162,7 +421,7 @@ def i_am_using_storage_provider(context, storage_provider):
             "bucket_name": "tlp-medusa-dev",
             "key_file": "~/.aws/credentials",
             "storage_provider": storage_provider,
-            "fqdn": "localhost",
+            "fqdn": "127.0.0.1",
             "api_key_or_username": "",
             "api_secret_or_password": "",
             "api_profile": "default",
@@ -193,20 +452,60 @@ def i_am_using_storage_provider(context, storage_provider):
                 "sstableloader",
             )
         ),
+        "resolve_ip_addresses": False
     }
 
+    if client_encryption == 'with_client_encryption':
+        config["cassandra"].update(
+            {
+                "certfile": certfile,
+                "usercert": usercert,
+                "userkey": userkey,
+                "sstableloader_ts": trustore_path,
+                "sstableloader_tspw": "truststorePass1",
+                "sstableloader_ks": keystore_path,
+                "sstableloader_kspw": "testdata1"
+            }
+        )
+
     config["monitoring"] = {"monitoring_provider": "local"}
+
+    config["checks"] = {
+        "health_check": "cql"
+    }
+
+    config["grpc"] = {
+        "enabled": 1,
+    }
+
+    config['kubernetes'] = {
+        "enabled": 1,
+        "cassandra_url": "http://127.0.0.1:8778/jolokia/",
+    }
+
+    GRPCServer.destroy()
+    context.grpc_server = GRPCServer.init(config)
+
+    context.grpc_client = medusa.service.grpc.client.Client(
+        "127.0.0.1:50051",
+        channel_options=[('grpc.enable_retries', 0)]
+    )
 
     context.medusa_config = MedusaConfig(
         storage=_namedtuple_from_dict(StorageConfig, config["storage"]),
         cassandra=_namedtuple_from_dict(CassandraConfig, config["cassandra"]),
         monitoring=_namedtuple_from_dict(MonitoringConfig, config["monitoring"]),
         ssh=None,
-        restore=None,
-        logging=None
+        checks=_namedtuple_from_dict(ChecksConfig, config["checks"]),
+        logging=None,
+        grpc=_namedtuple_from_dict(GrpcConfig, config["grpc"]),
+        kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes']),
     )
+
     cleanup_storage(context, storage_provider)
-    cleanup_monitoring(context)
+
+    # sleep for a few seconds to give gRPC server a chance to initialize
+    time.sleep(3)
 
 
 @when(r'I create the "{table_name}" table in keyspace "{keyspace_name}"')
@@ -248,8 +547,45 @@ def _i_run_a_whatever_command(context, command):
 @when(r'I perform a backup in "{backup_mode}" mode of the node named "{backup_name}"')
 def _i_perform_a_backup_of_the_node_named_backupname(context, backup_mode, backup_name):
     (actual_backup_duration, actual_start, end, node_backup, node_backup_cache, num_files, start) \
-        = medusa.backup.main(context.medusa_config, backup_name, None, backup_mode)
+        = medusa.backup_node.main(context.medusa_config, backup_name, None, backup_mode)
     context.latest_backup_cache = node_backup_cache
+
+
+@when(r'I perform a backup over gRPC in "{backup_mode}" mode of the node named "{backup_name}"')
+def _i_perform_grpc_backup_of_node_named_backupname(context, backup_mode, backup_name):
+    context.grpc_client.backup(backup_name, backup_mode)
+
+
+@then(r'I verify over gRPC that the backup "{backup_name}" exists')
+def _i_verify_over_grpc_backup_exists(context, backup_name):
+    found = False
+    backups = context.grpc_client.get_backups()
+    for backup in backups:
+        if backup.backupName == backup_name:
+            found = True
+            break
+    assert found is True
+
+
+@then(r'I delete the backup "{backup_name}" over gRPC')
+def _i_delete_backup_grpc(context, backup_name):
+    context.grpc_client.delete_backup(backup_name)
+
+
+@then(r'I verify over gRPC the backup "{backup_name}" does not exist')
+def _i_verify_over_grpc_backup_does_not_exist(context, backup_name):
+    assert not context.grpc_client.backup_exists(backup_name)
+
+
+@then(r'the gRPC server is up')
+def _check_grpc_server_is_up(context):
+    resp = context.grpc_client.health_check()
+    assert resp.status == 1
+
+
+@then(r'I shutdown the gRPC server')
+def _i_shutdown_the_grpc_server(context):
+    context.grpc_server.destroy()
 
 
 @then(r'I can see the backup named "{backup_name}" when I list the backups')
@@ -339,9 +675,12 @@ def _i_can_download_the_backup_all_tables_successfully(context, backup_name):
     )
     fqtn = set({})
     medusa.download.download_data(context.medusa_config.storage, backup, fqtn, Path(download_path))
+    # check all manifest objects that have been backed up have been downloaded
+    keyspaces = {section['keyspace'] for section in json.loads(backup.manifest) if section['objects']}
+    for ks in keyspaces:
+        ks_path = os.path.join(download_path, ks)
+        assert os.path.isdir(ks_path)
 
-    sys_dist = os.path.join(download_path, 'system_distributed')
-    assert os.path.isdir(sys_dist)
     cleanup(download_path)
 
 
@@ -361,10 +700,18 @@ def _i_can_download_the_backup_single_table_successfully(context, backup_name, f
         fqdn=config.storage.fqdn,
         name=backup_name,
     )
-    medusa.download.download_data(context.medusa_config.storage, backup, fqtn, Path(download_path))
 
-    sys_dist = os.path.join(download_path, 'system_distributed')
-    assert os.path.isdir(sys_dist)
+    # download_data requires fqtn with table id
+    fqtns_to_download, _ = medusa.filtering.filter_fqtns([], [fqtn], backup.manifest, True)
+    medusa.download.download_data(context.medusa_config.storage, backup, fqtns_to_download, Path(download_path))
+
+    # check the keyspace directory has been created
+    ks, table = fqtn.split('.')
+    ks_path = os.path.join(download_path, ks)
+    assert os.path.isdir(ks_path)
+
+    # check tables have been downloaded
+    assert list(Path(ks_path).glob('{}-*/*.db'.format(table)))
     cleanup(download_path)
 
 
@@ -416,9 +763,12 @@ def _i_restore_the_backup_named_for_table(context, backup_name, fqtn):
     )
 
 
-@then(r'I have {nb_rows} rows in the "{table_name}" table')
-def _i_have_rows_in_the_table(context, nb_rows, table_name):
-    context.session = connect_cassandra()
+@then(r'I have {nb_rows} rows in the "{table_name}" table in ccm cluster "{client_encryption}"')
+def _i_have_rows_in_the_table(context, nb_rows, table_name, client_encryption):
+    is_client_encryption_enable = False
+    if client_encryption == 'with_client_encryption':
+        is_client_encryption_enable = True
+    context.session = connect_cassandra(is_client_encryption_enable)
     rows = context.session.execute("select count(*) as nb from {}".format(table_name))
     assert rows[0].nb == int(nb_rows)
 
@@ -463,6 +813,8 @@ def _the_latest_backup_for_fqdn_is_called_backupname(
 def _there_is_no_latest_backup_for_node_fqdn(context, fqdn):
     storage = Storage(config=context.medusa_config.storage)
     node_backup = storage.latest_node_backup(fqdn=fqdn)
+    logging.info("Latest node backup is {}".format(
+        node_backup.name if node_backup is not None else "None"))
     assert node_backup is None
 
 
@@ -572,7 +924,7 @@ def _truncate_the_index(context):
 def _truncate_the_backup_folder(context):
     storage = Storage(config=context.medusa_config.storage)
     path_root = "/tmp/medusa_it_bucket"
-    backup_path = "{}/{}localhost".format(path_root, storage.prefix_path)
+    backup_path = "{}/{}127.0.0.1".format(path_root, storage.prefix_path)
     shutil.rmtree(backup_path)
 
 
@@ -642,6 +994,9 @@ def _backup_named_something_has_nb_files_in_the_manifest(
                         nb_files, len(section["objects"])
                     )
                 )
+                logging.error(
+                    "Files in the manifest: {}".format(section["objects"])
+                )
                 assert len(section["objects"]) == int(nb_files)
 
 
@@ -682,9 +1037,13 @@ def _i_see_metrics_emitted(context, metrics_count):
     assert int(len(metrics)) == int(metrics_count)
 
 
-@when(r'I truncate the "{table_name}" table')
-def _i_truncate_the_table(context, table_name):
-    context.session = connect_cassandra()
+@when(r'I truncate the "{table_name}" table in ccm cluster "{client_encryption}"')
+def _i_truncate_the_table(context, table_name, client_encryption):
+    is_client_encryption_enable = False
+
+    if client_encryption == 'with_client_encryption':
+        is_client_encryption_enable = True
+    context.session = connect_cassandra(is_client_encryption_enable)
     context.session.execute("truncate {}".format(table_name))
 
 
@@ -699,11 +1058,13 @@ def _i_can_verify_the_restore_verify_query_returned_rows(context, query, expecte
         storage=context.medusa_config.storage,
         cassandra=context.medusa_config.cassandra,
         monitoring=context.medusa_config.monitoring,
-        restore=_namedtuple_from_dict(ChecksConfig, restore_config),
+        checks=_namedtuple_from_dict(ChecksConfig, restore_config),
         ssh=None,
-        logging=None
+        logging=None,
+        grpc=None,
+        kubernetes=None,
     )
-    medusa.verify_restore.verify_restore(["localhost"], custom_config)
+    medusa.verify_restore.verify_restore(["127.0.0.1"], custom_config)
 
 
 @when(r'I delete the backup named "{backup_name}"')
@@ -712,13 +1073,25 @@ def _i_delete_the_backup_named(context, backup_name, all_nodes=False):
                                backup_name=backup_name, all_nodes=all_nodes)
 
 
-def connect_cassandra():
+def connect_cassandra(is_client_encryption_enable):
     connected = False
     attempt = 0
     session = None
+    _ssl_context = None
+
+    if is_client_encryption_enable:
+
+        ssl_context = SSLContext(PROTOCOL_TLSv1)
+        ssl_context.load_verify_locations(certfile)
+        ssl_context.verify_mode = CERT_REQUIRED
+        ssl_context.load_cert_chain(
+            certfile=usercert,
+            keyfile=userkey)
+        _ssl_context = ssl_context
+
     while not connected and attempt < 10:
         try:
-            cluster = Cluster(["127.0.0.1"])
+            cluster = Cluster(contact_points=["127.0.0.1"], ssl_context=_ssl_context)
             session = cluster.connect()
             connected = True
         except cassandra.cluster.NoHostAvailable:
